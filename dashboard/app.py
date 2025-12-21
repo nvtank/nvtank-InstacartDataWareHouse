@@ -4,7 +4,13 @@ import plotly.express as px
 import plotly.graph_objects as go
 from sqlalchemy import text
 import sys
-sys.path.append('..')
+import os
+
+# Add project root to Python path
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
 from etl.config import get_engine
 
 # Page config
@@ -31,7 +37,7 @@ st.markdown("""
         border-radius: 0.5rem;
         box-shadow: 0 2px 4px rgba(0,0,0,0.1);
     }
-    .stMetric {s
+    .stMetric {
         background-color: #f0f2f6;
         padding: 15px;
         border-radius: 10px;
@@ -54,7 +60,7 @@ st.sidebar.markdown("---")
 page = st.sidebar.radio(
     "📑 Navigation",
     ["📊 Overview", "🏆 Products", "⏰ Time Analysis", 
-     "👥 Customers", "🏪 Departments"]
+     "👥 Customers", "🏪 Departments", "🗄️ Tables"]
 )
 
 st.sidebar.markdown("---")
@@ -86,3 +92,6 @@ elif page == "👥 Customers":
 elif page == "🏪 Departments":
     from pages import departments
     departments.show(engine)
+elif page == "🗄️ Tables":
+    from pages import tables
+    tables.show(engine)

@@ -6,7 +6,13 @@ Combines clustering and association rules for personalized recommendations
 import pandas as pd
 import numpy as np
 import sys
-sys.path.append('..')
+import os
+
+# Add project root to Python path
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
 from etl.config import get_engine
 
 def load_association_rules():
