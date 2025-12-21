@@ -1,3 +1,11 @@
+-- ============================================
+-- Fact_Order_Details: Order Line Items Fact
+-- ============================================
+-- Source: order_products__prior.csv + order_products__train.csv
+-- Total: 32,434,489 + 1,384,617 = 33,819,106 records
+-- Partitioning: RANGE by order_id (500K per partition)
+-- Granularity: 1 row = 1 product in 1 order
+-- ============================================
 
 USE instacart_dwh;
 

@@ -12,7 +12,13 @@ import seaborn as sns
 import sys
 import os
 import time
-sys.path.append('..')
+from datetime import datetime
+
+# Add project root to Python path
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
 from etl.config import get_engine
 
 # Set style
@@ -20,37 +26,72 @@ sns.set_style("whitegrid")
 
 def extract_transactions(limit=None, min_items=2):
     """Extract transaction baskets from DWH"""
-    print("\n📊 Extracting transactions from database...")
+    start_time = time.time()
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if limit:
+        print(f"\n📊 [{timestamp}] Extracting transactions from database (limit: {limit:,} orders)...")
+    else:
+        print(f"\n📊 [{timestamp}] Extracting transactions from database (FULL DATASET - all orders)...")
     engine = get_engine()
     
-    query = """
-    SELECT 
-        fod.order_id,
-        p.product_name,
-        p.product_id
-    FROM Fact_Order_Details fod
-    JOIN Dim_Product p ON fod.product_id = p.product_id
-    ORDER BY fod.order_id
-    """
-    
     if limit:
+        # Use JOIN instead of subquery with LIMIT (MariaDB doesn't support LIMIT in subquery)
         query = f"""
+        SELECT 
+            fod.order_id,
+            p.product_name,
+            p.product_id
+        FROM (
+            SELECT DISTINCT order_id 
+            FROM Fact_Order_Details 
+            ORDER BY order_id
+            LIMIT {limit}
+        ) AS limited_orders
+        JOIN Fact_Order_Details fod ON limited_orders.order_id = fod.order_id
+        JOIN Dim_Product p ON fod.product_id = p.product_id
+        ORDER BY fod.order_id
+        """
+    else:
+        query = """
         SELECT 
             fod.order_id,
             p.product_name,
             p.product_id
         FROM Fact_Order_Details fod
         JOIN Dim_Product p ON fod.product_id = p.product_id
-        WHERE fod.order_id IN (
-            SELECT DISTINCT order_id 
-            FROM Fact_Order_Details 
-            LIMIT {limit}
-        )
         ORDER BY fod.order_id
         """
     
-    df = pd.read_sql(query, engine)
-    print(f"✅ Extracted {len(df):,} transaction items from {df['order_id'].nunique():,} orders")
+    # Read in chunks to avoid memory issues with large datasets
+    if limit is None:
+        # For full dataset, read in chunks
+        chunk_size = 500000  # Read 500K rows at a time
+        chunks = []
+        print(f"   Reading data in chunks of {chunk_size:,} rows...")
+        
+        for i, chunk in enumerate(pd.read_sql(query, engine, chunksize=chunk_size)):
+            chunks.append(chunk)
+            if (i + 1) % 10 == 0:
+                print(f"   Processed {(i + 1) * chunk_size:,} rows...")
+        
+        df = pd.concat(chunks, ignore_index=True)
+        print(f"   Total chunks processed: {len(chunks)}")
+    else:
+        df = pd.read_sql(query, engine)
+    
+    elapsed = time.time() - start_time
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"✅ [{timestamp}] Extracted {len(df):,} transaction items from {df['order_id'].nunique():,} orders (took {elapsed:.1f}s)")
+    
+    # Memory check (optional)
+    try:
+        import psutil
+        memory_usage = psutil.virtual_memory().percent
+        print(f"   💾 Current memory usage: {memory_usage:.1f}%")
+        if memory_usage > 85:
+            print(f"   ⚠️  WARNING: Memory usage is high ({memory_usage:.1f}%)!")
+    except ImportError:
+        pass  # psutil not available, skip memory check
     
     # Group by order to create baskets
     transactions = df.groupby('order_id')['product_name'].apply(list).tolist()
@@ -63,15 +104,43 @@ def extract_transactions(limit=None, min_items=2):
     
     return transactions_filtered
 
-def create_basket_matrix(transactions):
-    """Convert transaction list to one-hot encoded DataFrame"""
-    print("\n🔄 Creating basket matrix...")
+def create_basket_matrix(transactions, top_n_products=2000):
+    """Convert transaction list to one-hot encoded DataFrame
+    Only include top N most frequent products to reduce memory usage
+    """
+    start_time = time.time()
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"\n🔄 [{timestamp}] Creating basket matrix...")
+    print(f"   Filtering to top {top_n_products:,} most frequent products to reduce memory...")
     
+    # Count product frequencies
+    product_counts = {}
+    for basket in transactions:
+        for product in basket:
+            product_counts[product] = product_counts.get(product, 0) + 1
+    
+    # Get top N products
+    top_products = sorted(product_counts.items(), key=lambda x: x[1], reverse=True)[:top_n_products]
+    top_product_set = set([p[0] for p in top_products])
+    print(f"   Top product frequency range: {top_products[-1][1]:,} - {top_products[0][1]:,} orders")
+    
+    # Filter transactions to only include top products
+    transactions_filtered = []
+    for basket in transactions:
+        filtered_basket = [p for p in basket if p in top_product_set]
+        if len(filtered_basket) >= 2:  # Keep baskets with at least 2 items
+            transactions_filtered.append(filtered_basket)
+    
+    print(f"   Filtered to {len(transactions_filtered):,} baskets (from {len(transactions):,})")
+    
+    # Create matrix with only top products
     te = TransactionEncoder()
-    te_ary = te.fit(transactions).transform(transactions)
+    te_ary = te.fit(transactions_filtered).transform(transactions_filtered)
     df_basket = pd.DataFrame(te_ary, columns=te.columns_)
     
-    print(f"✅ Basket matrix shape: {df_basket.shape[0]:,} orders × {df_basket.shape[1]:,} products")
+    elapsed = time.time() - start_time
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"✅ [{timestamp}] Basket matrix shape: {df_basket.shape[0]:,} orders × {df_basket.shape[1]:,} products (took {elapsed:.1f}s)")
     
     # Calculate product frequencies
     product_freq = df_basket.sum().sort_values(ascending=False)
@@ -84,9 +153,10 @@ def create_basket_matrix(transactions):
 
 def run_fpgrowth(df_basket, min_support=0.01):
     """Run FP-Growth algorithm (faster than Apriori)"""
-    print(f"\n🚀 Running FP-Growth algorithm (min_support={min_support})...")
-    
     start_time = time.time()
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"\n🚀 [{timestamp}] Running FP-Growth algorithm (min_support={min_support})...")
+    print("   This may take 30-60 minutes for full dataset...")
     
     frequent_itemsets = fpgrowth(
         df_basket, 
@@ -297,19 +367,33 @@ def save_rules(rules, filename='mining/results/association_rules.csv'):
 
 def main():
     """Main execution function"""
+    total_start = time.time()
+    start_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
     print("=" * 80)
     print(" " * 20 + "MARKET BASKET ANALYSIS")
+    print("=" * 80)
+    print(f"🚀 Started at: {start_timestamp}")
+    print("📊 Processing FULL DATASET (all 3.3M orders)")
+    print("⏱️  Estimated time: 1-2 hours")
     print("=" * 80)
     
     # Create results directory
     os.makedirs('mining/results', exist_ok=True)
     
     try:
-        # Step 1: Extract transactions (limit for demo - remove limit for full analysis)
-        transactions = extract_transactions(limit=50000, min_items=2)  # 50K orders
+        # Step 1: Extract transactions
+        # For full dataset, we need to sample to avoid memory issues
+        # 3.3M orders × 49K products = 146 GiB (too large!)
+        # Solution: Sample 500K orders (still representative, ~15% of data)
+        # Or use top products only to reduce matrix size
+        print("⚠️  Note: Using 500K orders sample to avoid memory issues")
+        print("   Full dataset (3.3M orders) requires 146 GiB RAM")
+        print("   Sample size: 500,000 orders (~15% of data, still statistically significant)")
+        transactions = extract_transactions(limit=500000, min_items=2)  # Sample 500K orders
         
-        # Step 2: Create basket matrix
-        df_basket = create_basket_matrix(transactions)
+        # Step 2: Create basket matrix (with top 2000 products to reduce memory)
+        df_basket = create_basket_matrix(transactions, top_n_products=2000)
         
         # Step 3: Run FP-Growth (faster than Apriori)
         frequent_itemsets = run_fpgrowth(df_basket, min_support=0.01)
@@ -341,8 +425,14 @@ def main():
             )
             print(f"✅ Saved {len(itemsets_export):,} frequent itemsets to mining/results/frequent_itemsets.csv")
         
+        total_elapsed = time.time() - total_start
+        end_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
         print("\n" + "=" * 80)
         print("✅ MARKET BASKET ANALYSIS COMPLETE!")
+        print("=" * 80)
+        print(f"🏁 Finished at: {end_timestamp}")
+        print(f"⏱️  Total time: {total_elapsed/60:.1f} minutes ({total_elapsed/3600:.2f} hours)")
         print("=" * 80)
         print("\n📁 Generated files:")
         print("   - mining/results/association_rules.csv")

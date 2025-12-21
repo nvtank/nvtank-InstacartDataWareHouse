@@ -13,8 +13,14 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import sys
 import os
-sys.path.append('..')
+
+# Add project root to Python path
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
 from etl.config import get_engine
+from sqlalchemy import text
 
 # Set style
 sns.set_style("whitegrid")
@@ -25,17 +31,35 @@ def extract_features():
     print("\n📊 Extracting customer features from database...")
     engine = get_engine()
     
+    # Step 1: Create temporary table for order statistics (much faster than subquery)
+    print("   Step 1/2: Creating temporary table for order statistics...")
+    with engine.connect() as conn:
+        conn.execute(text("""
+            CREATE TEMPORARY TABLE temp_order_stats AS
+            SELECT 
+                fod.order_id,
+                COUNT(fod.product_id) as item_count,
+                SUM(CASE WHEN fod.reordered = 1 THEN 1 ELSE 0 END) / COUNT(fod.product_id) as reorder_ratio
+            FROM Fact_Order_Details fod
+            GROUP BY fod.order_id
+        """))
+        conn.commit()
+        print("   ✅ Temporary table created")
+    
+    # Step 2: Query with temporary table (much faster)
+    print("   Step 2/2: Extracting user features...")
     query = """
     SELECT 
         u.user_id,
         u.total_orders,
-        AVG(fo.total_items) as avg_basket_size,
-        AVG(fo.reorder_ratio) as avg_reorder_ratio,
-        MIN(fo.days_since_prior) as min_days_between_orders,
-        AVG(fo.days_since_prior) as avg_days_between_orders,
-        MAX(fo.days_since_prior) as max_days_between_orders
+        AVG(tos.item_count) as avg_basket_size,
+        AVG(tos.reorder_ratio) as avg_reorder_ratio,
+        MIN(fo.days_since_prior_order) as min_days_between_orders,
+        AVG(fo.days_since_prior_order) as avg_days_between_orders,
+        MAX(fo.days_since_prior_order) as max_days_between_orders
     FROM Dim_User u
     JOIN Fact_Orders fo ON u.user_id = fo.user_id
+    JOIN temp_order_stats tos ON fo.order_id = tos.order_id
     WHERE u.total_orders >= 3  -- Filter active users only
     GROUP BY u.user_id, u.total_orders
     """
