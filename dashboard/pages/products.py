@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 
-@st.cache_data(ttl=600)  # Cache for 10 minutes
+@st.cache_data(ttl=86400, show_spinner="🏆 Loading top products...")
 def get_top_products(_engine):
     return pd.read_sql("""
         SELECT 
@@ -19,7 +19,7 @@ def get_top_products(_engine):
         LIMIT 20
     """, _engine)
 
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=86400, show_spinner="🔁 Loading reorder rates...")
 def get_aisle_reorder(_engine):
     return pd.read_sql("""
         SELECT 
@@ -117,44 +117,44 @@ def show(engine):
     except Exception as e:
         st.error(f"Error loading data: {str(e)}")
     
-    # Product Search
-    st.markdown("---")
-    st.subheader("🔍 Product Search")
+    # # Product Search
+    # st.markdown("---")
+    # st.subheader("🔍 Product Search")
     
-    search_term = st.text_input("Search product name:", placeholder="e.g., organic banana")
+    # search_term = st.text_input("Search product name:", placeholder="e.g., organic banana")
     
-    if search_term:
-        try:
-            df_search = pd.read_sql(f"""
-                SELECT 
-                    p.product_name,
-                    d.department_name,
-                    a.aisle_name,
-                    COUNT(DISTINCT fod.order_id) as orders,
-                    COUNT(*) as total_items,
-                    ROUND(AVG(fod.reordered) * 100, 1) as reorder_rate
-                FROM Fact_Order_Details fod
-                JOIN Dim_Product p ON fod.product_id = p.product_id
-                JOIN Dim_Department d ON p.department_id = d.department_id
-                JOIN Dim_Aisle a ON p.aisle_id = a.aisle_id
-                WHERE LOWER(p.product_name) LIKE LOWER('%{search_term}%')
-                GROUP BY p.product_id, p.product_name, d.department_name, a.aisle_name
-                ORDER BY orders DESC
-                LIMIT 50
-            """, engine)
+    # if search_term:
+    #     try:
+    #         df_search = pd.read_sql(f"""
+    #             SELECT 
+    #                 p.product_name,
+    #                 d.department_name,
+    #                 a.aisle_name,
+    #                 COUNT(DISTINCT fod.order_id) as orders,
+    #                 COUNT(*) as total_items,
+    #                 ROUND(AVG(fod.reordered) * 100, 1) as reorder_rate
+    #             FROM Fact_Order_Details fod
+    #             JOIN Dim_Product p ON fod.product_id = p.product_id
+    #             JOIN Dim_Department d ON p.department_id = d.department_id
+    #             JOIN Dim_Aisle a ON p.aisle_id = a.aisle_id
+    #             WHERE LOWER(p.product_name) LIKE LOWER('%{search_term}%')
+    #             GROUP BY p.product_id, p.product_name, d.department_name, a.aisle_name
+    #             ORDER BY orders DESC
+    #             LIMIT 50
+    #         """, engine)
             
-            if not df_search.empty:
-                st.success(f"Found {len(df_search)} products matching '{search_term}'")
-                st.dataframe(
-                    df_search.style.format({
-                        'orders': '{:,}',
-                        'total_items': '{:,}',
-                        'reorder_rate': '{:.1f}%'
-                    }),
-                    width='stretch',
-                    height=400
-                )
-            else:
-                st.warning(f"No products found matching '{search_term}'")
-        except Exception as e:
-            st.error(f"Error searching: {str(e)}")
+    #         if not df_search.empty:
+    #             st.success(f"Found {len(df_search)} products matching '{search_term}'")
+    #             st.dataframe(
+    #                 df_search.style.format({
+    #                     'orders': '{:,}',
+    #                     'total_items': '{:,}',
+    #                     'reorder_rate': '{:.1f}%'
+    #                 }),
+    #                 width='stretch',
+    #                 height=400
+    #             )
+    #         else:
+    #             st.warning(f"No products found matching '{search_term}'")
+    #     except Exception as e:
+    #         st.error(f"Error searching: {str(e)}")

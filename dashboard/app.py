@@ -1,3 +1,5 @@
+
+# Imports
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -12,8 +14,7 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 from etl.config import get_engine
-
-# Page config
+# Page config - PHẢI ĐẶT TRƯỚC CÁC IMPORTS KHÁC
 st.set_page_config(
     page_title="Instacart Analytics Dashboard",
     page_icon="🛒",
@@ -46,11 +47,17 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# Initialize database connection
-@st.cache_resource
+# Initialize database connection với persistent caching
+@st.cache_resource(show_spinner="🔌 Connecting to database...")
 def init_connection():
+    """
+    Initialize database connection
+    - Cached indefinitely (persistent across reruns)
+    - Only recreated if server restarts
+    """
     return get_engine()
 
+# Get cached connection
 engine = init_connection()
 
 # Sidebar navigation

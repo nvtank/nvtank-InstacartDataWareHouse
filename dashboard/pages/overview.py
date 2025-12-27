@@ -3,20 +3,27 @@ import pandas as pd
 import plotly.express as px
 from sqlalchemy import text
 
-@st.cache_data(ttl=300)  # Cache for 5 minutes
+# Tăng thời gian cache lên 30 phút (1800 giây) vì data không thay đổi thường xuyên
+# Thêm show_spinner để hiển thị loading indicator
+
+@st.cache_data(ttl=86400, show_spinner="📊 Loading orders data...")
 def get_total_orders(_engine):
+    """Get total number of orders (cached for 30 minutes)"""
     return pd.read_sql("SELECT COUNT(*) as cnt FROM Fact_Orders", _engine).iloc[0, 0]
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=86400, show_spinner="👥 Loading users data...")
 def get_total_users(_engine):
+    """Get total number of users (cached for 30 minutes)"""
     return pd.read_sql("SELECT COUNT(*) as cnt FROM Dim_User", _engine).iloc[0, 0]
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=86400, show_spinner="🛍️ Loading products data...")
 def get_total_products(_engine):
+    """Get total number of products (cached for 30 minutes)"""
     return pd.read_sql("SELECT COUNT(*) as cnt FROM Dim_Product", _engine).iloc[0, 0]
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=86400, show_spinner="🛒 Calculating basket size...")
 def get_avg_basket(_engine):
+    """Get average basket size (cached for 30 minutes)"""
     result = pd.read_sql("""
         SELECT AVG(total_items) as avg 
         FROM Fact_Orders 
@@ -24,8 +31,9 @@ def get_avg_basket(_engine):
     """, _engine)
     return result.iloc[0, 0] if not result.empty and result.iloc[0, 0] else None
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=86400, show_spinner="📅 Loading weekly trends...")
 def get_orders_by_dow(_engine):
+    """Get orders by day of week (cached for 30 minutes)"""
     return pd.read_sql("""
         SELECT 
             t.dow_name,
@@ -37,8 +45,9 @@ def get_orders_by_dow(_engine):
         ORDER BY t.order_dow
     """, _engine)
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=86400, show_spinner="🏪 Loading department data...")
 def get_market_share(_engine):
+    """Get market share by department (cached for 30 minutes)"""
     return pd.read_sql("""
         SELECT 
             d.department_name,
@@ -51,8 +60,9 @@ def get_market_share(_engine):
         LIMIT 10
     """, _engine)
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=86400, show_spinner="⏰ Loading hourly patterns...")
 def get_orders_by_hour(_engine):
+    """Get orders by hour of day (cached for 30 minutes)"""
     return pd.read_sql("""
         SELECT 
             t.order_hour,
@@ -151,30 +161,30 @@ def show(engine):
             st.error(f"Error loading data: {str(e)}")
     
     # Row 3: Hourly trend
-    st.markdown("---")
-    st.subheader("⏰ Orders by Hour of Day")
-    try:
-        df_hour = get_orders_by_hour(engine)
+    # st.markdown("---")
+    # st.subheader("⏰ Orders by Hour of Day")
+    # try:
+    #     df_hour = get_orders_by_hour(engine)
         
-        if not df_hour.empty:
-            fig = px.line(
-                df_hour, 
-                x='order_hour', 
-                y='orders',
-                markers=True,
-                labels={'order_hour': 'Hour of Day', 'orders': 'Number of Orders'}
-            )
-            fig.update_traces(line_color='#1f77b4', line_width=3)
-            fig.update_layout(
-                hovermode='x unified',
-                xaxis=dict(tickmode='linear', tick0=0, dtick=2)
-            )
-            st.plotly_chart(fig, width='stretch')
+    #     if not df_hour.empty:
+    #         fig = px.line(
+    #             df_hour, 
+    #             x='order_hour', 
+    #             y='orders',
+    #             markers=True,
+    #             labels={'order_hour': 'Hour of Day', 'orders': 'Number of Orders'}
+    #         )
+    #         fig.update_traces(line_color='#1f77b4', line_width=3)
+    #         fig.update_layout(
+    #             hovermode='x unified',
+    #             xaxis=dict(tickmode='linear', tick0=0, dtick=2)
+    #         )
+    #         st.plotly_chart(fig, width='stretch')
             
-            # Peak hour highlight
-            peak_hour = df_hour.loc[df_hour['orders'].idxmax()]
-            st.success(f"🔥 **Peak Hour:** {int(peak_hour['order_hour'])}:00 with {int(peak_hour['orders']):,} orders")
-        else:
-            st.info("No data available. Please run ETL pipeline first.")
-    except Exception as e:
-        st.error(f"Error loading data: {str(e)}")
+    #         # Peak hour highlight
+    #         peak_hour = df_hour.loc[df_hour['orders'].idxmax()]
+    #         st.success(f"🔥 **Peak Hour:** {int(peak_hour['order_hour'])}:00 with {int(peak_hour['orders']):,} orders")
+    #     else:
+    #         st.info("No data available. Please run ETL pipeline first.")
+    # except Exception as e:
+    #     st.error(f"Error loading data: {str(e)}")

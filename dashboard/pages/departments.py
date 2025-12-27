@@ -3,6 +3,64 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 
+# Cached data loading functions
+@st.cache_data(ttl=86400, show_spinner="🏪 Loading department data...")
+def get_department_overview(_engine):
+    """Get department performance overview (cached for 30 minutes)"""
+    return pd.read_sql("""
+        SELECT 
+            d.department_name,
+            COUNT(DISTINCT fod.order_id) as orders,
+            COUNT(*) as total_items,
+            ROUND(AVG(fod.reordered) * 100, 1) as reorder_rate,
+            COUNT(DISTINCT fod.product_id) as unique_products
+        FROM Fact_Order_Details fod
+        JOIN Dim_Product p ON fod.product_id = p.product_id
+        JOIN Dim_Department d ON p.department_id = d.department_id
+        GROUP BY d.department_id, d.department_name
+        ORDER BY total_items DESC
+    """, _engine)
+
+@st.cache_data(ttl=86400, show_spinner="🔁 Loading reorder data...")
+def get_department_reorder_rates(_engine):
+    """Get reorder rates by department (cached for 30 minutes)"""
+    return pd.read_sql("""
+        SELECT 
+            d.department_name,
+            ROUND(AVG(fod.reordered) * 100, 1) as reorder_rate,
+            COUNT(*) as items
+        FROM Fact_Order_Details fod
+        JOIN Dim_Product p ON fod.product_id = p.product_id
+        JOIN Dim_Department d ON p.department_id = d.department_id
+        GROUP BY d.department_id, d.department_name
+        ORDER BY reorder_rate DESC
+    """, _engine)
+
+@st.cache_data(ttl=86400)
+def get_department_list(_engine):
+    """Get list of all departments (cached for 30 minutes)"""
+    return pd.read_sql(
+        "SELECT DISTINCT department_name FROM Dim_Department ORDER BY department_name",
+        _engine
+    )['department_name'].tolist()
+
+@st.cache_data(ttl=86400)
+def get_department_comparison(_engine, dept1, dept2):
+    """Compare two departments (cached for 30 minutes)"""
+    return pd.read_sql(f"""
+        SELECT 
+            d.department_name,
+            COUNT(DISTINCT fod.order_id) as orders,
+            COUNT(*) as items,
+            ROUND(AVG(fod.reordered) * 100, 1) as reorder_rate,
+            COUNT(DISTINCT fod.product_id) as products
+        FROM Fact_Order_Details fod
+        JOIN Dim_Product p ON fod.product_id = p.product_id
+        JOIN Dim_Department d ON p.department_id = d.department_id
+        WHERE d.department_name IN ('{dept1}', '{dept2}')
+        GROUP BY d.department_name
+    """, _engine)
+
 def show(engine):
     st.header("🏪 Department Performance")
     st.markdown("Analyze department-level metrics and trends")
@@ -11,19 +69,8 @@ def show(engine):
     st.subheader("📊 Department Performance Overview")
     
     try:
-        df_dept = pd.read_sql("""
-            SELECT 
-                d.department_name,
-                COUNT(DISTINCT fod.order_id) as orders,
-                COUNT(*) as total_items,
-                ROUND(AVG(fod.reordered) * 100, 1) as reorder_rate,
-                COUNT(DISTINCT fod.product_id) as unique_products
-            FROM Fact_Order_Details fod
-            JOIN Dim_Product p ON fod.product_id = p.product_id
-            JOIN Dim_Department d ON p.department_id = d.department_id
-            GROUP BY d.department_id, d.department_name
-            ORDER BY total_items DESC
-        """, engine)
+        # Use cached function
+        df_dept = get_department_overview(engine)
         
         if not df_dept.empty:
             # Calculate market share
@@ -43,8 +90,8 @@ def show(engine):
                 },
                 title='Top 10 Departments by Sales Volume'
             )
-            fig.update_xaxis(tickangle=-45)
-            st.plotly_chart(fig, width='stretch')
+            fig.update_xaxes(tickangle=-45)
+            st.plotly_chart(fig, use_container_width=True)
             
             # Department details table
             st.markdown("**📋 Department Details:**")
@@ -56,7 +103,7 @@ def show(engine):
                     'unique_products': '{:,}',
                     'market_share': '{:.2f}%'
                 }),
-                width='stretch',
+                use_container_width=True,
                 height=400
             )
             
@@ -73,17 +120,8 @@ def show(engine):
     st.subheader("🔁 Reorder Rate Comparison")
     
     try:
-        df_reorder = pd.read_sql("""
-            SELECT 
-                d.department_name,
-                ROUND(AVG(fod.reordered) * 100, 1) as reorder_rate,
-                COUNT(*) as items
-            FROM Fact_Order_Details fod
-            JOIN Dim_Product p ON fod.product_id = p.product_id
-            JOIN Dim_Department d ON p.department_id = d.department_id
-            GROUP BY d.department_id, d.department_name
-            ORDER BY reorder_rate DESC
-        """, engine)
+        # Use cached function
+        df_reorder = get_department_reorder_rates(engine)
         
         if not df_reorder.empty:
             col1, col2 = st.columns(2)
@@ -107,7 +145,7 @@ def show(engine):
                     yaxis={'categoryorder': 'total ascending'},
                     height=600
                 )
-                st.plotly_chart(fig, width='stretch')
+                st.plotly_chart(fig, use_container_width=True)
             
             with col2:
                 # Scatter plot: Items vs Reorder Rate
@@ -126,7 +164,7 @@ def show(engine):
                     title='Sales Volume vs Reorder Rate'
                 )
                 fig.update_layout(height=600)
-                st.plotly_chart(fig, width='stretch')
+                st.plotly_chart(fig, use_container_width=True)
             
             # Best and worst reorder rate
             best_reorder = df_reorder.iloc[0]
@@ -147,11 +185,8 @@ def show(engine):
     st.subheader("🔍 Department Comparison")
     
     try:
-        # Get department list for dropdown
-        dept_list = pd.read_sql(
-            "SELECT DISTINCT department_name FROM Dim_Department ORDER BY department_name",
-            engine
-        )['department_name'].tolist()
+        # Get department list for dropdown (cached)
+        dept_list = get_department_list(engine)
         
         col1, col2 = st.columns(2)
         with col1:
@@ -160,19 +195,8 @@ def show(engine):
             dept2 = st.selectbox("Select Department 2:", dept_list, index=min(1, len(dept_list)-1), key='dept2')
         
         if dept1 and dept2:
-            df_compare = pd.read_sql(f"""
-                SELECT 
-                    d.department_name,
-                    COUNT(DISTINCT fod.order_id) as orders,
-                    COUNT(*) as items,
-                    ROUND(AVG(fod.reordered) * 100, 1) as reorder_rate,
-                    COUNT(DISTINCT fod.product_id) as products
-                FROM Fact_Order_Details fod
-                JOIN Dim_Product p ON fod.product_id = p.product_id
-                JOIN Dim_Department d ON p.department_id = d.department_id
-                WHERE d.department_name IN ('{dept1}', '{dept2}')
-                GROUP BY d.department_name
-            """, engine)
+            # Use cached comparison function
+            df_compare = get_department_comparison(engine, dept1, dept2)
             
             if not df_compare.empty and len(df_compare) == 2:
                 metrics = ['orders', 'items', 'reorder_rate', 'products']
@@ -197,7 +221,7 @@ def show(engine):
                     title=f'Department Comparison: {dept1} vs {dept2}'
                 )
                 
-                st.plotly_chart(fig, width='stretch')
+                st.plotly_chart(fig, use_container_width=True)
             else:
                 st.warning("Unable to compare departments. Please ensure data exists for both.")
     except Exception as e:

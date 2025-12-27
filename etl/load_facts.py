@@ -30,8 +30,36 @@ def load_fact_orders(engine):
         df = df[df['eval_set'].isin(['prior', 'train'])].copy()
         print(f"  ✓ Filtered to {len(df):,} orders (prior + train)")
         
+        # Validate and clean time data
+        print(f"\n  🔍 Validating time data...")
+        
+        # Check for invalid hours (must be 0-23)
+        invalid_hours = df[~df['order_hour_of_day'].between(0, 23)]
+        if len(invalid_hours) > 0:
+            print(f"  ⚠️  WARNING: Found {len(invalid_hours):,} orders with invalid hours!")
+            print(f"     Hour range: {df['order_hour_of_day'].min():.0f} - {df['order_hour_of_day'].max():.0f}")
+            print(f"     Unique invalid hours: {sorted(invalid_hours['order_hour_of_day'].unique())}")
+            # Fix: Use MOD 24 to wrap invalid hours back to 0-23
+            print(f"  🔧 Fixing invalid hours using MOD 24...")
+            df['order_hour_of_day'] = df['order_hour_of_day'] % 24
+            print(f"  ✓ Fixed! Hour range now: {df['order_hour_of_day'].min():.0f} - {df['order_hour_of_day'].max():.0f}")
+        
+        # Check for invalid days (must be 0-6)
+        invalid_days = df[~df['order_dow'].between(0, 6)]
+        if len(invalid_days) > 0:
+            print(f"  ⚠️  WARNING: Found {len(invalid_days):,} orders with invalid days!")
+            print(f"     Day range: {df['order_dow'].min():.0f} - {df['order_dow'].max():.0f}")
+            # Fix: Use MOD 7 to wrap invalid days back to 0-6
+            print(f"  🔧 Fixing invalid days using MOD 7...")
+            df['order_dow'] = df['order_dow'] % 7
+            print(f"  ✓ Fixed! Day range now: {df['order_dow'].min():.0f} - {df['order_dow'].max():.0f}")
+        
         # Create time_id (dow * 100 + hour)
         df['time_id'] = df['order_dow'] * 100 + df['order_hour_of_day']
+        
+        # Verify time_id is valid (should match Dim_Time)
+        unique_time_ids = df['time_id'].nunique()
+        print(f"  ✓ Created {unique_time_ids} unique time_id values (expected: up to 168 for 7 days × 24 hours)")
         
         # Select and rename columns
         fact_df = df[[
