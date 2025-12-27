@@ -3,6 +3,50 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 
+# Cached data loading functions
+@st.cache_data(ttl=86400, show_spinner="🔥 Loading heatmap data...")
+def get_heatmap_data(_engine):
+    """Get order heatmap data (cached for 30 minutes)"""
+    return pd.read_sql("""
+        SELECT 
+            t.order_dow,
+            t.dow_name,
+            t.order_hour,
+            COUNT(*) as orders
+        FROM Fact_Orders fo
+        INNER JOIN Dim_Time t ON fo.time_id = t.time_id
+        GROUP BY t.order_dow, t.dow_name, t.order_hour
+        ORDER BY t.order_dow, t.order_hour
+    """, _engine)
+
+@st.cache_data(ttl=86400, show_spinner="� Loading weekend comparison...")
+def get_weekend_comparison(_engine):
+    """Get weekend vs weekday comparison (cached for 30 minutes)"""
+    return pd.read_sql("""
+        SELECT 
+            CASE WHEN t.is_weekend = 1 THEN 'Weekend' ELSE 'Weekday' END as day_type,
+            COUNT(DISTINCT fo.order_id) as orders,
+            AVG(fo.total_items) as avg_basket,
+            AVG(fo.reorder_ratio) * 100 as avg_reorder
+        FROM Fact_Orders fo
+        JOIN Dim_Time t ON fo.time_id = t.time_id
+        GROUP BY day_type
+    """, _engine)
+
+@st.cache_data(ttl=86400)
+def get_debug_data(_engine):
+    """Get debug information (cached for 30 minutes)"""
+    return pd.read_sql("""
+        SELECT 
+            fo.order_dow,
+            fo.time_id,
+            COUNT(*) as cnt,
+            COUNT(DISTINCT fo.time_id) as distinct_time_ids
+        FROM Fact_Orders fo
+        GROUP BY fo.order_dow
+        ORDER BY fo.order_dow
+    """, _engine)
+
 def show(engine):
     st.header("⏰ Time Analysis")
     st.markdown("Analyze temporal patterns and shopping behaviors")
@@ -11,41 +55,9 @@ def show(engine):
     st.subheader("🔥 Order Heatmap: Hour x Day of Week")
     
     try:
-        # First, check what data we actually have
-        debug_query = """
-            SELECT 
-                fo.order_dow,
-                fo.time_id,
-                COUNT(*) as cnt,
-                COUNT(DISTINCT fo.time_id) as distinct_time_ids
-            FROM Fact_Orders fo
-            GROUP BY fo.order_dow
-            ORDER BY fo.order_dow
-        """
-        debug_df = pd.read_sql(debug_query, engine)
-        
-        # Try to get data directly from Fact_Orders first, then join for day names
-        df_heatmap = pd.read_sql("""
-            SELECT 
-                fo.order_dow,
-                COALESCE(t.dow_name, 
-                    CASE fo.order_dow
-                        WHEN 0 THEN 'Sunday'
-                        WHEN 1 THEN 'Monday'
-                        WHEN 2 THEN 'Tuesday'
-                        WHEN 3 THEN 'Wednesday'
-                        WHEN 4 THEN 'Thursday'
-                        WHEN 5 THEN 'Friday'
-                        WHEN 6 THEN 'Saturday'
-                    END
-                ) as dow_name,
-                MOD(fo.time_id, 100) as order_hour,
-                COUNT(*) as orders
-            FROM Fact_Orders fo
-            LEFT JOIN Dim_Time t ON fo.time_id = t.time_id
-            GROUP BY fo.order_dow, dow_name, order_hour
-            ORDER BY fo.order_dow, order_hour
-        """, engine)
+        # Use cached functions
+        df_heatmap = get_heatmap_data(engine)
+        debug_df = get_debug_data(engine)
         
         if not df_heatmap.empty:
             # Show debug info
@@ -211,16 +223,8 @@ def show(engine):
     st.subheader("📊 Weekend vs Weekday Comparison")
     
     try:
-        df_comparison = pd.read_sql("""
-            SELECT 
-                CASE WHEN t.is_weekend = 1 THEN 'Weekend' ELSE 'Weekday' END as day_type,
-                COUNT(DISTINCT fo.order_id) as orders,
-                AVG(fo.total_items) as avg_basket,
-                AVG(fo.reorder_ratio) * 100 as avg_reorder
-            FROM Fact_Orders fo
-            JOIN Dim_Time t ON fo.time_id = t.time_id
-            GROUP BY day_type
-        """, engine)
+        # Use cached function
+        df_comparison = get_weekend_comparison(engine)
         
         if not df_comparison.empty:
             col1, col2, col3 = st.columns(3)
@@ -235,7 +239,7 @@ def show(engine):
                     labels={'orders': 'Total Orders', 'day_type': ''}
                 )
                 fig.update_layout(showlegend=False, title="Total Orders")
-                st.plotly_chart(fig, width='stretch')
+                st.plotly_chart(fig, use_container_width=True)
             
             with col2:
                 fig = px.bar(
@@ -247,7 +251,7 @@ def show(engine):
                     labels={'avg_basket': 'Avg Items', 'day_type': ''}
                 )
                 fig.update_layout(showlegend=False, title="Avg Basket Size")
-                st.plotly_chart(fig, width='stretch')
+                st.plotly_chart(fig, use_container_width=True)
             
             with col3:
                 fig = px.bar(
@@ -259,7 +263,7 @@ def show(engine):
                     labels={'avg_reorder': 'Reorder Rate (%)', 'day_type': ''}
                 )
                 fig.update_layout(showlegend=False, title="Avg Reorder Rate %")
-                st.plotly_chart(fig, width='stretch')
+                st.plotly_chart(fig, use_container_width=True)
             
             # Comparison insights
             weekday_df = df_comparison[df_comparison['day_type'] == 'Weekday']
@@ -282,42 +286,42 @@ def show(engine):
     except Exception as e:
         st.error(f"Error loading data: {str(e)}")
     
-    # Hourly distribution by weekday/weekend
-    st.markdown("---")
-    st.subheader("📈 Hourly Order Distribution: Weekday vs Weekend")
+    # # Hourly distribution by weekday/weekend
+    # st.markdown("---")
+    # st.subheader("📈 Hourly Order Distribution: Weekday vs Weekend")
     
-    try:
-        df_hourly = pd.read_sql("""
-            SELECT 
-                t.order_hour,
-                CASE WHEN t.is_weekend = 1 THEN 'Weekend' ELSE 'Weekday' END as day_type,
-                COUNT(*) as orders
-            FROM Fact_Orders fo
-            JOIN Dim_Time t ON fo.time_id = t.time_id
-            GROUP BY t.order_hour, day_type
-            ORDER BY t.order_hour
-        """, engine)
+    # try:
+    #     df_hourly = pd.read_sql("""
+    #         SELECT 
+    #             t.order_hour,
+    #             CASE WHEN t.is_weekend = 1 THEN 'Weekend' ELSE 'Weekday' END as day_type,
+    #             COUNT(*) as orders
+    #         FROM Fact_Orders fo
+    #         JOIN Dim_Time t ON fo.time_id = t.time_id
+    #         GROUP BY t.order_hour, day_type
+    #         ORDER BY t.order_hour
+    #     """, engine)
         
-        if not df_hourly.empty:
-            fig = px.line(
-                df_hourly,
-                x='order_hour',
-                y='orders',
-                color='day_type',
-                markers=True,
-                labels={
-                    'order_hour': 'Hour of Day',
-                    'orders': 'Number of Orders',
-                    'day_type': 'Day Type'
-                }
-            )
-            fig.update_layout(
-                hovermode='x unified',
-                xaxis=dict(tickmode='linear', tick0=0, dtick=2),
-                legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1)
-            )
-            st.plotly_chart(fig, width='stretch')
-        else:
-            st.info("No data available. Please run ETL pipeline first.")
-    except Exception as e:
-        st.error(f"Error loading data: {str(e)}")
+    #     if not df_hourly.empty:
+    #         fig = px.line(
+    #             df_hourly,
+    #             x='order_hour',
+    #             y='orders',
+    #             color='day_type',
+    #             markers=True,
+    #             labels={
+    #                 'order_hour': 'Hour of Day',
+    #                 'orders': 'Number of Orders',
+    #                 'day_type': 'Day Type'
+    #             }
+    #         )
+    #         fig.update_layout(
+    #             hovermode='x unified',
+    #             xaxis=dict(tickmode='linear', tick0=0, dtick=2),
+    #             legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1)
+    #         )
+    #         st.plotly_chart(fig, use_container_width=True)
+    #     else:
+    #         st.info("No data available. Please run ETL pipeline first.")
+    # except Exception as e:
+    #     st.error(f"Error loading data: {str(e)}")
