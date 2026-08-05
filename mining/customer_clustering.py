@@ -1,381 +1,382 @@
-"""
-Customer Clustering using K-Means
-Segments customers based on shopping behavior
-"""
+"""Reproducible K-Means customer segmentation over warehouse aggregates."""
 
-import pandas as pd
+from __future__ import annotations
+
+import argparse
+from collections.abc import Sequence
+from pathlib import Path
+
+import matplotlib.pyplot as plt
 import numpy as np
-from sklearn.preprocessing import StandardScaler
+import pandas as pd
+import seaborn as sns
 from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
-from sklearn.metrics import silhouette_score, davies_bouldin_score
-import matplotlib.pyplot as plt
-import seaborn as sns
-import sys
-import os
-
-# Add project root to Python path
-project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if project_root not in sys.path:
-    sys.path.insert(0, project_root)
-
-from etl.config import get_engine
+from sklearn.metrics import davies_bouldin_score, silhouette_score
+from sklearn.preprocessing import StandardScaler
 from sqlalchemy import text
+from sqlalchemy.engine import Engine
 
-# Set style
+from etl.config import Settings, get_engine, get_settings
+from mining.artifacts import dump_joblib, ensure_results_dir, utc_timestamp, write_json
+
+FEATURE_COLUMNS = (
+    "total_orders",
+    "avg_basket_size",
+    "avg_reorder_ratio",
+    "avg_days_between_orders",
+)
+DEFAULT_SILHOUETTE_SAMPLE_SIZE = 10_000
+
 sns.set_style("whitegrid")
-plt.rcParams['figure.figsize'] = (12, 8)
 
-def extract_features():
-    """Extract customer features from DWH"""
-    print("\n📊 Extracting customer features from database...")
-    engine = get_engine()
-    
-    # Step 1: Create temporary table for order statistics (much faster than subquery)
-    print("   Step 1/2: Creating temporary table for order statistics...")
-    with engine.connect() as conn:
-        conn.execute(text("""
-            CREATE TEMPORARY TABLE temp_order_stats AS
-            SELECT 
-                fod.order_id,
-                COUNT(fod.product_id) as item_count,
-                SUM(CASE WHEN fod.reordered = 1 THEN 1 ELSE 0 END) / COUNT(fod.product_id) as reorder_ratio
-            FROM Fact_Order_Details fod
-            GROUP BY fod.order_id
-        """))
-        conn.commit()
-        print("   ✅ Temporary table created")
-    
-    # Step 2: Query with temporary table (much faster)
-    print("   Step 2/2: Extracting user features...")
-    query = """
-    SELECT 
-        u.user_id,
-        u.total_orders,
-        AVG(tos.item_count) as avg_basket_size,
-        AVG(tos.reorder_ratio) as avg_reorder_ratio,
-        MIN(fo.days_since_prior_order) as min_days_between_orders,
-        AVG(fo.days_since_prior_order) as avg_days_between_orders,
-        MAX(fo.days_since_prior_order) as max_days_between_orders
-    FROM Dim_User u
-    JOIN Fact_Orders fo ON u.user_id = fo.user_id
-    JOIN temp_order_stats tos ON fo.order_id = tos.order_id
-    WHERE u.total_orders >= 3  -- Filter active users only
-    GROUP BY u.user_id, u.total_orders
-    """
-    
-    df = pd.read_sql(query, engine)
-    print(f"✅ Extracted {len(df):,} users with behavioral features")
-    print(f"   Features: {list(df.columns)[1:]}")
-    
-    return df
 
-def find_optimal_k(X_scaled, max_k=10):
-    """Use Elbow Method to find optimal number of clusters"""
-    print(f"\n🔍 Running Elbow Method (K=2 to {max_k})...")
-    
-    inertias = []
-    silhouette_scores = []
-    K_range = range(2, max_k + 1)
-    
-    for k in K_range:
-        kmeans = KMeans(n_clusters=k, random_state=42, n_init=10, max_iter=300)
-        kmeans.fit(X_scaled)
-        inertias.append(kmeans.inertia_)
-        
-        # Calculate silhouette score
-        labels = kmeans.labels_
-        score = silhouette_score(X_scaled, labels)
-        silhouette_scores.append(score)
-        
-        print(f"   K={k}: Inertia={kmeans.inertia_:.2f}, Silhouette={score:.3f}")
-    
-    # Plot elbow curve
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5))
-    
-    # Inertia plot
-    ax1.plot(K_range, inertias, 'bo-', linewidth=2, markersize=8)
-    ax1.set_xlabel('Number of Clusters (K)', fontsize=12)
-    ax1.set_ylabel('Inertia (Within-cluster sum of squares)', fontsize=12)
-    ax1.set_title('Elbow Method: Inertia vs K', fontsize=14, fontweight='bold')
-    ax1.grid(True, alpha=0.3)
-    
-    # Silhouette plot
-    ax2.plot(K_range, silhouette_scores, 'ro-', linewidth=2, markersize=8)
-    ax2.set_xlabel('Number of Clusters (K)', fontsize=12)
-    ax2.set_ylabel('Silhouette Score', fontsize=12)
-    ax2.set_title('Silhouette Score vs K', fontsize=14, fontweight='bold')
-    ax2.grid(True, alpha=0.3)
-    
-    plt.tight_layout()
-    plt.savefig('mining/results/elbow_curve.png', dpi=300, bbox_inches='tight')
-    print(f"✅ Saved elbow curve to mining/results/elbow_curve.png")
-    plt.close()
-    
-    # Recommend optimal K
-    optimal_k = K_range[np.argmax(silhouette_scores)]
-    print(f"\n💡 Recommended K={optimal_k} (highest silhouette score)")
-    
+class ClusteringDataError(ValueError):
+    """Raised when warehouse features cannot produce a meaningful clustering model."""
+
+
+def extract_features(
+    engine: Engine | None = None,
+    *,
+    min_orders: int = 3,
+    settings: Settings | None = None,
+) -> pd.DataFrame:
+    """Extract user features directly from Dim_User and Fact_Orders."""
+    if min_orders < 2:
+        raise ValueError("min_orders must be at least 2")
+    resolved = settings or get_settings()
+    warehouse_engine = engine or get_engine(resolved)
+    query = text(
+        """
+        SELECT
+            users.user_id,
+            COUNT(*) AS total_orders,
+            AVG(orders.total_items) AS avg_basket_size,
+            AVG(orders.reorder_ratio) AS avg_reorder_ratio,
+            AVG(orders.days_since_prior_order) AS avg_days_between_orders
+        FROM Dim_User users
+        JOIN Fact_Orders orders ON users.user_id = orders.user_id
+        WHERE orders.total_items > 0
+        GROUP BY users.user_id
+        HAVING COUNT(*) >= :min_orders
+        ORDER BY users.user_id
+        """
+    )
+    with warehouse_engine.connect() as connection:
+        features = pd.read_sql(query, connection, params={"min_orders": min_orders})
+    _feature_matrix(features)
+    return features
+
+
+def _feature_matrix(frame: pd.DataFrame) -> pd.DataFrame:
+    missing = [column for column in ("user_id", *FEATURE_COLUMNS) if column not in frame]
+    if missing:
+        raise ClusteringDataError(f"Missing clustering columns: {', '.join(missing)}")
+    if len(frame) < 3:
+        raise ClusteringDataError("At least three active users are required for clustering")
+
+    matrix = frame.loc[:, FEATURE_COLUMNS].apply(pd.to_numeric, errors="coerce")
+    values = matrix.to_numpy(dtype=float)
+    if not np.isfinite(values).all():
+        invalid = matrix.columns[~np.isfinite(values).all(axis=0)].tolist()
+        raise ClusteringDataError(
+            "Clustering features contain NULL or non-finite values: " + ", ".join(invalid)
+        )
+    return matrix
+
+
+def _bounded_silhouette(
+    values: np.ndarray,
+    labels: np.ndarray,
+    *,
+    sample_size: int,
+    random_state: int,
+) -> float:
+    if sample_size < 2:
+        raise ValueError("silhouette sample size must be at least 2")
+    if len(values) != len(labels):
+        raise ClusteringDataError("Feature rows and cluster labels must have equal length")
+
+    unique_labels = np.unique(labels)
+    if len(unique_labels) < 2 or len(unique_labels) >= len(values):
+        raise ClusteringDataError(
+            "Silhouette scoring requires between 2 and number_of_rows - 1 clusters"
+        )
+
+    # sklearn samples rows without stratification, which can create an invalid
+    # sample containing one row per label (or only one label). Seed one row from
+    # every cluster, then fill the remaining deterministic budget at random.
+    bounded_size = min(
+        max(sample_size, len(unique_labels) + 1),
+        len(values),
+    )
+    if bounded_size == len(values):
+        return float(silhouette_score(values, labels))
+
+    rng = np.random.default_rng(random_state)
+    selected = [
+        int(rng.choice(np.flatnonzero(labels == label))) for label in unique_labels
+    ]
+    available = np.setdiff1d(np.arange(len(values)), selected, assume_unique=True)
+    extra = rng.choice(
+        available,
+        size=bounded_size - len(selected),
+        replace=False,
+    )
+    indices = np.sort(np.concatenate((np.asarray(selected, dtype=int), extra)))
+    return float(silhouette_score(values[indices], labels[indices]))
+
+
+def find_optimal_k(
+    X_scaled: np.ndarray,
+    max_k: int = 10,
+    *,
+    random_state: int = 42,
+    silhouette_sample_size: int = DEFAULT_SILHOUETTE_SAMPLE_SIZE,
+    output_dir: Path | str | None = None,
+) -> tuple[list[float], list[float], int]:
+    """Select K by a deterministic, bounded silhouette score."""
+    if len(X_scaled) < 3:
+        raise ClusteringDataError("At least three rows are required to select K")
+    largest_k = min(max_k, len(X_scaled) - 1)
+    if largest_k < 2:
+        raise ClusteringDataError("No valid K candidates are available")
+
+    candidate_k = list(range(2, largest_k + 1))
+    inertias: list[float] = []
+    silhouette_scores: list[float] = []
+    for k in candidate_k:
+        model = KMeans(n_clusters=k, random_state=random_state, n_init=10, max_iter=300)
+        labels = model.fit_predict(X_scaled)
+        inertias.append(float(model.inertia_))
+        silhouette_scores.append(
+            _bounded_silhouette(
+                X_scaled,
+                labels,
+                sample_size=silhouette_sample_size,
+                random_state=random_state,
+            )
+        )
+
+    optimal_k = candidate_k[int(np.argmax(silhouette_scores))]
+    if output_dir is not None:
+        destination = ensure_results_dir(output_dir) / "cluster_selection.png"
+        figure, (inertia_axis, silhouette_axis) = plt.subplots(1, 2, figsize=(14, 5))
+        inertia_axis.plot(candidate_k, inertias, "o-")
+        inertia_axis.set(title="K-Means inertia", xlabel="K", ylabel="Inertia")
+        silhouette_axis.plot(candidate_k, silhouette_scores, "o-")
+        silhouette_axis.set(title="Bounded silhouette score", xlabel="K", ylabel="Score")
+        figure.tight_layout()
+        figure.savefig(destination, dpi=200, bbox_inches="tight")
+        plt.close(figure)
     return inertias, silhouette_scores, optimal_k
 
-def train_kmeans(df, n_clusters=4):
-    """Train K-Means clustering model"""
-    print(f"\n🤖 Training K-Means with K={n_clusters}...")
-    
-    # Select features
-    features = ['total_orders', 'avg_basket_size', 'avg_reorder_ratio', 
-                'avg_days_between_orders']
-    X = df[features].fillna(0)
-    
-    # Standardization (important for K-Means)
+
+def train_kmeans(
+    frame: pd.DataFrame,
+    n_clusters: int = 4,
+    *,
+    random_state: int = 42,
+    silhouette_sample_size: int = DEFAULT_SILHOUETTE_SAMPLE_SIZE,
+) -> tuple[pd.DataFrame, KMeans, StandardScaler, np.ndarray]:
+    """Fit the selected K and return labels plus reusable preprocessing artifacts."""
+    matrix = _feature_matrix(frame)
+    if not 2 <= n_clusters < len(matrix):
+        raise ValueError("n_clusters must be between 2 and number_of_users - 1")
     scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-    
-    # Train K-Means
-    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10, max_iter=300)
-    df['cluster'] = kmeans.fit_predict(X_scaled)
-    
-    # Evaluate clustering
-    silhouette_avg = silhouette_score(X_scaled, df['cluster'])
-    davies_bouldin = davies_bouldin_score(X_scaled, df['cluster'])
-    
-    print(f"✅ Clustering complete!")
-    print(f"   Silhouette Score: {silhouette_avg:.3f} (higher is better, range: -1 to 1)")
-    print(f"   Davies-Bouldin Index: {davies_bouldin:.3f} (lower is better)")
-    print(f"   Inertia: {kmeans.inertia_:.2f}")
-    
-    print(f"\n📊 Cluster distribution:")
-    cluster_counts = df['cluster'].value_counts().sort_index()
-    for cluster_id, count in cluster_counts.items():
-        pct = (count / len(df)) * 100
-        print(f"   Cluster {cluster_id}: {count:,} users ({pct:.1f}%)")
-    
-    return df, kmeans, scaler, X_scaled
+    scaled = scaler.fit_transform(matrix)
+    model = KMeans(
+        n_clusters=n_clusters,
+        random_state=random_state,
+        n_init=10,
+        max_iter=300,
+    )
+    clustered = frame.copy()
+    clustered["cluster"] = model.fit_predict(scaled)
+    model.training_metrics_ = {
+        "silhouette": _bounded_silhouette(
+            scaled,
+            model.labels_,
+            sample_size=silhouette_sample_size,
+            random_state=random_state,
+        ),
+        "davies_bouldin": float(davies_bouldin_score(scaled, model.labels_)),
+        "inertia": float(model.inertia_),
+    }
+    return clustered, model, scaler, scaled
 
-def visualize_clusters(df, X_scaled):
-    """Visualize clusters using PCA dimensionality reduction"""
-    print("\n📊 Creating cluster visualizations...")
-    
-    # PCA to 2D
-    pca = PCA(n_components=2, random_state=42)
-    X_pca = pca.fit_transform(X_scaled)
-    
-    # Explained variance
-    var_explained = pca.explained_variance_ratio_
-    print(f"   PCA explained variance: PC1={var_explained[0]:.1%}, PC2={var_explained[1]:.1%}")
-    print(f"   Total: {var_explained.sum():.1%}")
-    
-    # Create scatter plot
-    plt.figure(figsize=(14, 10))
-    
-    # Plot each cluster with different color
-    clusters = df['cluster'].unique()
-    colors = plt.cm.viridis(np.linspace(0, 1, len(clusters)))
-    
-    for cluster_id, color in zip(sorted(clusters), colors):
-        mask = df['cluster'] == cluster_id
-        cluster_points = X_pca[mask]
-        
-        plt.scatter(
-            cluster_points[:, 0], 
-            cluster_points[:, 1],
-            c=[color],
-            label=f'Cluster {cluster_id}',
-            alpha=0.6,
-            s=50,
-            edgecolors='w',
-            linewidth=0.5
+
+def visualize_clusters(
+    frame: pd.DataFrame,
+    X_scaled: np.ndarray,
+    *,
+    output_dir: Path | str | None = None,
+    random_state: int = 42,
+    max_points: int = 20_000,
+) -> dict[str, float]:
+    """Save a bounded PCA projection without changing training labels."""
+    destination = ensure_results_dir(output_dir)
+    pca = PCA(n_components=2, random_state=random_state)
+    projection = pca.fit_transform(X_scaled)
+    if len(frame) > max_points:
+        rng = np.random.default_rng(random_state)
+        selected = np.sort(rng.choice(len(frame), size=max_points, replace=False))
+    else:
+        selected = np.arange(len(frame))
+
+    figure, axis = plt.subplots(figsize=(11, 8))
+    scatter = axis.scatter(
+        projection[selected, 0],
+        projection[selected, 1],
+        c=frame.iloc[selected]["cluster"],
+        cmap="viridis",
+        alpha=0.55,
+        s=18,
+    )
+    axis.set(title="Customer clusters (PCA projection)", xlabel="PC1", ylabel="PC2")
+    figure.colorbar(scatter, ax=axis, label="Cluster")
+    figure.tight_layout()
+    figure.savefig(destination / "clusters_pca.png", dpi=200, bbox_inches="tight")
+    plt.close(figure)
+    return {
+        "pc1_explained_variance": float(pca.explained_variance_ratio_[0]),
+        "pc2_explained_variance": float(pca.explained_variance_ratio_[1]),
+    }
+
+
+def _cluster_name(mean_orders: float) -> str:
+    if mean_orders >= 50:
+        return "VIP Customers"
+    if mean_orders >= 20:
+        return "Frequent Shoppers"
+    if mean_orders >= 10:
+        return "Regular Customers"
+    return "Occasional Buyers"
+
+
+def profile_clusters(
+    frame: pd.DataFrame,
+    *,
+    output_dir: Path | str | None = None,
+) -> pd.DataFrame:
+    required = {"user_id", "cluster", *FEATURE_COLUMNS}
+    missing = sorted(required.difference(frame.columns))
+    if missing:
+        raise ClusteringDataError(f"Missing profile columns: {', '.join(missing)}")
+    profiles = (
+        frame.groupby("cluster", as_index=False)
+        .agg(
+            num_users=("user_id", "count"),
+            total_orders_mean=("total_orders", "mean"),
+            total_orders_median=("total_orders", "median"),
+            avg_basket_size_mean=("avg_basket_size", "mean"),
+            avg_reorder_ratio_mean=("avg_reorder_ratio", "mean"),
+            avg_days_between_orders_mean=("avg_days_between_orders", "mean"),
         )
-    
-    plt.xlabel(f'Principal Component 1 ({var_explained[0]:.1%} variance)', fontsize=12)
-    plt.ylabel(f'Principal Component 2 ({var_explained[1]:.1%} variance)', fontsize=12)
-    plt.title('Customer Clusters Visualization (PCA Projection)', fontsize=14, fontweight='bold')
-    plt.legend(loc='best', framealpha=0.9)
-    plt.grid(True, alpha=0.3)
-    
-    plt.tight_layout()
-    plt.savefig('mining/results/clusters_pca.png', dpi=300, bbox_inches='tight')
-    print(f"✅ Saved PCA visualization to mining/results/clusters_pca.png")
-    plt.close()
-    
-    # Create 3D visualization if possible
-    try:
-        from mpl_toolkits.mplot3d import Axes3D
-        
-        pca_3d = PCA(n_components=3, random_state=42)
-        X_pca_3d = pca_3d.fit_transform(X_scaled)
-        
-        fig = plt.figure(figsize=(14, 10))
-        ax = fig.add_subplot(111, projection='3d')
-        
-        for cluster_id, color in zip(sorted(clusters), colors):
-            mask = df['cluster'] == cluster_id
-            cluster_points = X_pca_3d[mask]
-            
-            ax.scatter(
-                cluster_points[:, 0],
-                cluster_points[:, 1],
-                cluster_points[:, 2],
-                c=[color],
-                label=f'Cluster {cluster_id}',
-                alpha=0.6,
-                s=30
-            )
-        
-        ax.set_xlabel('PC1', fontsize=10)
-        ax.set_ylabel('PC2', fontsize=10)
-        ax.set_zlabel('PC3', fontsize=10)
-        ax.set_title('3D Cluster Visualization', fontsize=14, fontweight='bold')
-        ax.legend()
-        
-        plt.savefig('mining/results/clusters_3d.png', dpi=300, bbox_inches='tight')
-        print(f"✅ Saved 3D visualization to mining/results/clusters_3d.png")
-        plt.close()
-    except ImportError:
-        print("   ⚠️ 3D visualization skipped (matplotlib 3D not available)")
-
-def profile_clusters(df):
-    """Generate detailed cluster profiles"""
-    print("\n📋 Generating cluster profiles...")
-    
-    profiles = df.groupby('cluster').agg({
-        'user_id': 'count',
-        'total_orders': ['mean', 'median', 'min', 'max'],
-        'avg_basket_size': ['mean', 'std'],
-        'avg_reorder_ratio': ['mean', 'std'],
-        'avg_days_between_orders': ['mean', 'std']
-    }).round(2)
-    
-    profiles.columns = ['_'.join(col).strip('_') for col in profiles.columns]
-    profiles = profiles.reset_index()
-    profiles.rename(columns={'user_id_count': 'num_users'}, inplace=True)
-    
-    # Assign cluster names based on characteristics
-    cluster_names = []
-    for idx, row in profiles.iterrows():
-        if row['total_orders_mean'] >= 50:
-            cluster_names.append('VIP Customers')
-        elif row['total_orders_mean'] >= 20:
-            cluster_names.append('Frequent Shoppers')
-        elif row['total_orders_mean'] >= 10:
-            cluster_names.append('Regular Customers')
-        else:
-            cluster_names.append('Occasional Buyers')
-    
-    profiles['cluster_name'] = cluster_names
-    
-    # Reorder columns
-    cols = ['cluster', 'cluster_name', 'num_users'] + [col for col in profiles.columns if col not in ['cluster', 'cluster_name', 'num_users']]
-    profiles = profiles[cols]
-    
-    print("\n" + "=" * 120)
-    print("CLUSTER PROFILES")
-    print("=" * 120)
-    print(profiles.to_string(index=False))
-    print("=" * 120)
-    
-    # Save to CSV
-    profiles.to_csv('mining/results/cluster_profiles.csv', index=False)
-    print(f"\n✅ Saved cluster profiles to mining/results/cluster_profiles.csv")
-    
-    # Create bar chart
-    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
-    
-    # Plot 1: Users per cluster
-    axes[0, 0].bar(profiles['cluster_name'], profiles['num_users'], color='skyblue')
-    axes[0, 0].set_title('Number of Users per Cluster', fontweight='bold')
-    axes[0, 0].set_ylabel('Users')
-    axes[0, 0].tick_params(axis='x', rotation=45)
-    
-    # Plot 2: Avg orders
-    axes[0, 1].bar(profiles['cluster_name'], profiles['total_orders_mean'], color='salmon')
-    axes[0, 1].set_title('Average Orders per Cluster', fontweight='bold')
-    axes[0, 1].set_ylabel('Avg Orders')
-    axes[0, 1].tick_params(axis='x', rotation=45)
-    
-    # Plot 3: Avg basket size
-    axes[1, 0].bar(profiles['cluster_name'], profiles['avg_basket_size_mean'], color='lightgreen')
-    axes[1, 0].set_title('Average Basket Size per Cluster', fontweight='bold')
-    axes[1, 0].set_ylabel('Avg Items per Order')
-    axes[1, 0].tick_params(axis='x', rotation=45)
-    
-    # Plot 4: Avg reorder ratio
-    axes[1, 1].bar(profiles['cluster_name'], profiles['avg_reorder_ratio_mean'], color='gold')
-    axes[1, 1].set_title('Average Reorder Ratio per Cluster', fontweight='bold')
-    axes[1, 1].set_ylabel('Reorder Ratio')
-    axes[1, 1].tick_params(axis='x', rotation=45)
-    
-    plt.tight_layout()
-    plt.savefig('mining/results/cluster_profiles_chart.png', dpi=300, bbox_inches='tight')
-    print(f"✅ Saved profile charts to mining/results/cluster_profiles_chart.png")
-    plt.close()
-    
+        .sort_values("cluster")
+    )
+    profiles.insert(
+        1,
+        "cluster_name",
+        profiles["total_orders_mean"].map(_cluster_name),
+    )
+    profiles.to_csv(ensure_results_dir(output_dir) / "cluster_profiles.csv", index=False)
     return profiles
 
-def save_cluster_labels(df):
-    """Save user-cluster assignments to database"""
-    print("\n💾 Saving cluster labels...")
-    
-    # Save to CSV
-    df[['user_id', 'cluster']].to_csv(
-        'mining/results/cluster_labels.csv', 
-        index=False
-    )
-    print(f"✅ Saved {len(df):,} cluster labels to mining/results/cluster_labels.csv")
 
-def main():
-    """Main execution function"""
-    print("=" * 80)
-    print(" " * 20 + "CUSTOMER CLUSTERING - K-MEANS")
-    print("=" * 80)
-    
-    # Create results directory if not exists
-    os.makedirs('mining/results', exist_ok=True)
-    
-    try:
-        # Step 1: Extract features
-        df = extract_features()
-        
-        # Step 2: Prepare data for clustering
-        features = ['total_orders', 'avg_basket_size', 'avg_reorder_ratio', 
-                    'avg_days_between_orders']
-        X = df[features].fillna(0)
-        scaler = StandardScaler()
-        X_scaled = scaler.fit_transform(X)
-        
-        # Step 3: Find optimal K
-        inertias, silhouette_scores, optimal_k = find_optimal_k(X_scaled, max_k=10)
-        
-        # Step 4: Train with optimal K (or use K=4 as default)
-        use_k = 4  # Can change to optimal_k if preferred
-        df, kmeans, scaler, X_scaled = train_kmeans(df, n_clusters=use_k)
-        
-        # Step 5: Visualize clusters
-        visualize_clusters(df, X_scaled)
-        
-        # Step 6: Profile clusters
-        profiles = profile_clusters(df)
-        
-        # Step 7: Save results
-        save_cluster_labels(df)
-        
-        print("\n" + "=" * 80)
-        print("✅ CUSTOMER CLUSTERING COMPLETE!")
-        print("=" * 80)
-        print("\n📁 Generated files:")
-        print("   - mining/results/elbow_curve.png")
-        print("   - mining/results/clusters_pca.png")
-        print("   - mining/results/cluster_profiles.csv")
-        print("   - mining/results/cluster_profiles_chart.png")
-        print("   - mining/results/cluster_labels.csv")
-        
-    except Exception as e:
-        print(f"\n❌ Error: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        return 1
-    
+def save_cluster_labels(
+    frame: pd.DataFrame,
+    *,
+    output_dir: Path | str | None = None,
+) -> Path:
+    missing = {"user_id", "cluster"}.difference(frame.columns)
+    if missing:
+        raise ClusteringDataError(f"Missing label columns: {', '.join(sorted(missing))}")
+    path = ensure_results_dir(output_dir) / "cluster_labels.csv"
+    frame.loc[:, ["user_id", "cluster"]].sort_values("user_id").to_csv(path, index=False)
+    return path
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--min-orders", type=int, default=3)
+    parser.add_argument("--max-k", type=int, default=10)
+    parser.add_argument("--clusters", type=int, help="Explicit K override; default uses selected K")
+    parser.add_argument("--silhouette-sample-size", type=int, default=10_000)
+    parser.add_argument("--seed", type=int, help="Override MINING_RANDOM_STATE")
+    parser.add_argument("--output-dir", type=Path)
+    parser.add_argument("--no-plots", action="store_true")
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    settings = get_settings()
+    random_state = settings.mining_random_state if args.seed is None else args.seed
+    output_dir = ensure_results_dir(args.output_dir)
+    features = extract_features(min_orders=args.min_orders, settings=settings)
+    scaler_for_selection = StandardScaler()
+    scaled_for_selection = scaler_for_selection.fit_transform(_feature_matrix(features))
+    inertias, silhouette_scores, optimal_k = find_optimal_k(
+        scaled_for_selection,
+        max_k=args.max_k,
+        random_state=random_state,
+        silhouette_sample_size=args.silhouette_sample_size,
+        output_dir=None if args.no_plots else output_dir,
+    )
+    selected_k = args.clusters if args.clusters is not None else optimal_k
+    clustered, model, scaler, scaled = train_kmeans(
+        features,
+        n_clusters=selected_k,
+        random_state=random_state,
+        silhouette_sample_size=args.silhouette_sample_size,
+    )
+    pca_metrics = (
+        {}
+        if args.no_plots
+        else visualize_clusters(
+            clustered,
+            scaled,
+            output_dir=output_dir,
+            random_state=random_state,
+        )
+    )
+    profiles = profile_clusters(clustered, output_dir=output_dir)
+    labels_path = save_cluster_labels(clustered, output_dir=output_dir)
+    model_path = dump_joblib(output_dir / "kmeans_model.joblib", model)
+    scaler_path = dump_joblib(output_dir / "standard_scaler.joblib", scaler)
+
+    candidate_k = list(range(2, 2 + len(inertias)))
+    metadata = {
+        "artifact_schema_version": 1,
+        "created_at": utc_timestamp(),
+        "feature_columns": list(FEATURE_COLUMNS),
+        "min_orders": args.min_orders,
+        "n_users": len(clustered),
+        "random_state": random_state,
+        "silhouette_sample_size": min(args.silhouette_sample_size, len(clustered)),
+        "selected_k": selected_k,
+        "selected_k_source": "cli_override" if args.clusters is not None else "silhouette",
+        "selection": [
+            {"k": k, "inertia": inertia, "silhouette": score}
+            for k, inertia, score in zip(candidate_k, inertias, silhouette_scores, strict=True)
+        ],
+        "training_metrics": model.training_metrics_,
+        "pca_metrics": pca_metrics,
+        "cluster_profiles": profiles.to_dict(orient="records"),
+        "artifacts": {
+            "model": model_path.name,
+            "scaler": scaler_path.name,
+            "labels": labels_path.name,
+        },
+    }
+    write_json(output_dir / "clustering_metadata.json", metadata)
+    print(
+        f"Clustered {len(clustered):,} users with K={selected_k}; "
+        f"silhouette={model.training_metrics_['silhouette']:.3f}. Artifacts: {output_dir}"
+    )
     return 0
 
+
 if __name__ == "__main__":
-    exit(main())
+    raise SystemExit(main())

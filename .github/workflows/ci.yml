@@ -37,7 +37,7 @@ jobs:
           python -m pip install --editable ".[dev]"
 
       - name: Lint application and tests
-        run: ruff check etl dashboard tests
+        run: ruff check etl dashboard mining tests
 
       - name: Run deterministic ETL tests with coverage
         run: |
@@ -69,3 +69,14 @@ jobs:
             --cov-report=term-missing \
             --cov-report=xml:coverage-dashboard.xml \
             --cov-fail-under=80
+
+      - name: Run deterministic mining and recommendation tests
+        env:
+          MPLBACKEND: Agg
+        run: |
+          pytest \
+            tests/test_mining_artifacts.py \
+            tests/test_mining_clustering.py \
+            tests/test_mining_market_basket.py \
+            tests/test_mining_recommendation.py \
+            -W error::FutureWarning
