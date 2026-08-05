@@ -36,16 +36,36 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install --editable ".[dev]"
 
-      - name: Lint ETL and tests
-        run: ruff check etl tests
+      - name: Lint application and tests
+        run: ruff check etl dashboard tests
 
       - name: Run deterministic ETL tests with coverage
         run: |
           pytest \
+            tests/test_config.py \
+            tests/test_quality.py \
+            tests/test_transforms.py \
+            tests/test_etl_cli.py \
             --cov=etl.config \
             --cov=etl.quality \
             --cov=etl.transforms \
             --cov=etl.etl_pipeline \
             --cov-report=term-missing \
-            --cov-report=xml \
+            --cov-report=xml:coverage-etl.xml \
             --cov-fail-under=90
+
+      - name: Run offline dashboard tests and six-page smoke coverage
+        env:
+          DASHBOARD_MODE: demo
+        run: |
+          pytest \
+            tests/test_dashboard_data.py \
+            tests/test_dashboard_app.py \
+            --cov=dashboard.data \
+            --cov=dashboard.demo_data \
+            --cov=dashboard.components \
+            --cov=dashboard.styles \
+            --cov=dashboard.pages \
+            --cov-report=term-missing \
+            --cov-report=xml:coverage-dashboard.xml \
+            --cov-fail-under=80

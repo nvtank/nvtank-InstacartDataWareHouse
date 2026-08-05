@@ -278,7 +278,7 @@ def basket_distribution() -> pd.DataFrame:
             (2, "6-10 items", 1_100_000, 55.8),
             (3, "11-20 items", 1_050_000, 64.9),
             (4, "21-30 items", 400_000, 71.7),
-            (5, "31+ items", 221_083, 76.3),
+            (5, "31+ items", 146_083, 76.3),
         ],
         columns=["bucket_order", "basket_size", "orders", "avg_reorder_rate_pct"],
     )

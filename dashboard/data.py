@@ -877,12 +877,15 @@ def _build_engine(settings: Any) -> Any:
 
 
 def _setting(settings: Any, *keys: str, default: Any = None) -> Any:
+    # Explicitly supplied settings must win over ambient process variables,
+    # even when the caller uses a lower-case/dataclass alias for the same key.
     for key in keys:
         if settings is not None:
             if isinstance(settings, Mapping) and key in settings:
                 return settings[key]
             if hasattr(settings, key):
                 return getattr(settings, key)
+    for key in keys:
         if key in os.environ:
             return os.environ[key]
     return default
