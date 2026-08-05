@@ -1,0 +1,74 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "instacart-intelligence-platform"
+version = "2.0.0"
+description = "A reproducible Instacart data warehouse, analytics dashboard, and recommendation lab."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "nvtank" }]
+keywords = ["data-warehouse", "etl", "analytics", "streamlit", "recommendation-system"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+]
+dependencies = [
+  "joblib>=1.4,<2",
+  "matplotlib>=3.9,<4",
+  "mlxtend>=0.23,<1",
+  "numpy>=1.26,<3",
+  "pandas>=2.2,<3",
+  "plotly>=5.22,<7",
+  "PyMySQL>=1.1,<2",
+  "python-dotenv>=1.0,<2",
+  "scikit-learn>=1.5,<2",
+  "seaborn>=0.13,<1",
+  "SQLAlchemy>=2.0,<3",
+  "streamlit>=1.39,<2",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3,<9",
+  "pytest-cov>=6,<8",
+  "ruff>=0.9,<1",
+]
+
+[project.scripts]
+instacart-etl = "etl.etl_pipeline:cli"
+instacart-cluster = "mining.customer_clustering:main"
+instacart-basket = "mining.market_basket:main"
+instacart-recommend = "mining.recommendation:main"
+
+[tool.setuptools.packages.find]
+include = ["dashboard*", "etl*", "mining*"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers --strict-config"
+testpaths = ["tests"]
+
+[tool.coverage.run]
+branch = true
+source = ["dashboard", "etl", "mining"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+extend-exclude = [".venv", "data", "mining/results"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"dashboard/app.py" = ["E402"]
