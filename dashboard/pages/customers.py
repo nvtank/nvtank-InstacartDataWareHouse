@@ -1,220 +1,202 @@
-import streamlit as st
+"""Truthful rule-based customer segmentation page."""
+
+from __future__ import annotations
+
 import pandas as pd
 import plotly.express as px
-import plotly.graph_objects as go
+import streamlit as st
 
-# Cached data loading functions
-@st.cache_data(ttl=86400, show_spinner="👥 Loading customer segments...")
-def get_customer_segments(_engine):
-    """Get customer segmentation data from K-Means clustering (cached for 1 day)"""
-    return pd.read_sql("""
-        SELECT 
-            u.segment,
-            COUNT(DISTINCT u.user_id) as users,
-            AVG(u.total_orders) as avg_orders,
-            SUM(u.total_orders) as total_orders,
-            AVG(u.avg_basket_size) as avg_basket_size
-        FROM Dim_User u
-        WHERE u.segment IS NOT NULL AND u.segment != 'Unknown'
-        GROUP BY u.segment
-        ORDER BY 
-            CASE u.segment 
-                WHEN 'VIP' THEN 1 
-                WHEN 'Frequent Shopper' THEN 2 
-                WHEN 'Regular' THEN 3
-                WHEN 'Occasional Buyer' THEN 4
-                ELSE 5 
-            END
-    """, _engine)
+from dashboard.components import (
+    download_frame,
+    format_integer,
+    format_percent,
+    insight_card,
+    load_repository_data,
+    page_header,
+    plotly_chart,
+    require_columns,
+)
+from dashboard.data import AnalyticsRepository
+from dashboard.styles import CATEGORICAL_PALETTE, SEQUENTIAL_SCALE, style_figure
 
-@st.cache_data(ttl=86400, show_spinner="🛒 Loading basket distribution...")
-def get_basket_distribution(_engine):
-    """Get basket size distribution (cached for 30 minutes)"""
-    return pd.read_sql("""
-        SELECT 
-            CASE 
-                WHEN fo.total_items BETWEEN 1 AND 5 THEN '1-5 items'
-                WHEN fo.total_items BETWEEN 6 AND 10 THEN '6-10 items'
-                WHEN fo.total_items BETWEEN 11 AND 20 THEN '11-20 items'
-                WHEN fo.total_items BETWEEN 21 AND 30 THEN '21-30 items'
-                ELSE '30+ items'
-            END as basket_size,
-            COUNT(*) as orders,
-            ROUND(AVG(fo.reorder_ratio) * 100, 1) as avg_reorder_rate
-        FROM Fact_Orders fo
-        WHERE fo.total_items > 0
-        GROUP BY basket_size
-        ORDER BY MIN(fo.total_items)
-    """, _engine)
+SEGMENT_ORDER = ["VIP", "Frequent", "Regular", "New"]
 
-def show(engine):
-    st.header("👥 Customer Analytics")
-    st.markdown("Understand customer segments and shopping behaviors")
-    
-    # User Segmentation
-    st.subheader("🎯 Customer Segmentation")
-    
-    try:
-        # Use cached function
-        df_segment = get_customer_segments(engine)
-        
-        if not df_segment.empty:
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                # Pie chart for user distribution
-                fig = px.pie(
-                    df_segment,
-                    values='users',
-                    names='segment',
-                    title='Customer Distribution by K-Means Clustering',
-                    color='segment',
-                    color_discrete_map={
-                        'VIP': '#FFD700',
-                        'Frequent Shopper': '#FF6B6B',
-                        'Regular': '#4169E1',
-                        'Occasional Buyer': '#90EE90'
-                    },
-                    hole=0.4
-                )
-                fig.update_traces(textposition='inside', textinfo='percent+label')
-                st.plotly_chart(fig, use_container_width=True)
-            
-            with col2:
-                # Bar chart for orders by segment
-                fig = px.bar(
-                    df_segment,
-                    x='segment',
-                    y='total_orders',
-                    color='segment',
-                    title='Total Orders by Segment',
-                    color_discrete_map={
-                        'VIP': '#FFD700',
-                        'Frequent Shopper': '#FF6B6B',
-                        'Regular': '#4169E1',
-                        'Occasional Buyer': '#90EE90'
-                    },
-                    labels={'total_orders': 'Total Orders', 'segment': 'Segment'}
-                )
-                fig.update_layout(showlegend=False)
-                st.plotly_chart(fig, use_container_width=True)
-            
-            # Segment details table
-            st.markdown("**📊 Segment Details:**")
-            df_display = df_segment.copy()
-            df_display['avg_orders'] = df_display['avg_orders'].round(1)
-            st.dataframe(
-                df_display.style.format({
-                    'users': '{:,}',
-                    'avg_orders': '{:.1f}',
-                    'total_orders': '{:,}'
-                }),
-                use_container_width=True
+
+def _ordered_segments(frame: pd.DataFrame) -> pd.DataFrame:
+    ordered = frame.copy()
+    rank = {name: index for index, name in enumerate(SEGMENT_ORDER)}
+    ordered["_rank"] = ordered["user_segment"].map(rank).fillna(len(rank))
+    return ordered.sort_values(["_rank", "user_segment"]).drop(columns="_rank")
+
+
+def show(repository: AnalyticsRepository) -> None:
+    page_header(
+        "Customer segments",
+        (
+            "Compare customer reach, order contribution, and basket behavior using "
+            "the deterministic segment rules produced by the ETL pipeline."
+        ),
+        eyebrow="Customer behavior",
+    )
+    st.info(
+        "These are rule-based warehouse segments, not K-Means clusters. "
+        "VIP has at least 50 orders; Frequent 20–49; Regular 10–19; New fewer than 10."
+    )
+
+    segments = load_repository_data(
+        repository,
+        "customer_segments",
+        loading_label="Loading customer segments…",
+    )
+    segment_ok = require_columns(
+        segments,
+        (
+            "user_segment",
+            "users",
+            "total_orders",
+            "avg_orders",
+            "avg_basket_size",
+            "user_share_pct",
+            "order_share_pct",
+        ),
+        context="Customer segment",
+    )
+    if segment_ok:
+        segments = _ordered_segments(segments)
+        share_frame = segments.melt(
+            id_vars="user_segment",
+            value_vars=["user_share_pct", "order_share_pct"],
+            var_name="measure",
+            value_name="share_pct",
+        )
+        share_frame["measure"] = share_frame["measure"].map(
+            {
+                "user_share_pct": "Customer share",
+                "order_share_pct": "Order contribution",
+            }
+        )
+        share_chart = px.bar(
+            share_frame,
+            x="user_segment",
+            y="share_pct",
+            color="measure",
+            barmode="group",
+            color_discrete_sequence=CATEGORICAL_PALETTE[:2],
+            title="Customer share versus order contribution",
+            labels={
+                "user_segment": "Rule-based segment",
+                "share_pct": "Share (%)",
+                "measure": "Measure",
+            },
+        )
+        share_chart.update_traces(hovertemplate="%{x}<br>%{y:.1f}%<extra>%{fullData.name}</extra>")
+        plotly_chart(
+            style_figure(share_chart, horizontal_legend=True, legend=True),
+            key="customers-segment-share",
+        )
+
+        contribution_gap = segments.assign(
+            gap=segments["order_share_pct"] - segments["user_share_pct"]
+        )
+        strongest = contribution_gap.loc[contribution_gap["gap"].idxmax()]
+        detail_left, detail_right = st.columns(2)
+        with detail_left:
+            insight_card(
+                "Highest contribution leverage",
+                (
+                    f"{strongest['user_segment']} customers represent "
+                    f"{format_percent(strongest['user_share_pct'])} of customers and "
+                    f"{format_percent(strongest['order_share_pct'])} of orders."
+                ),
             )
-            
-            # VIP insights
-            vip_row = df_segment[df_segment['segment'] == 'VIP'].iloc[0]
-            vip_percentage = (vip_row['users'] / df_segment['users'].sum()) * 100
-            vip_order_percentage = (vip_row['total_orders'] / df_segment['total_orders'].sum()) * 100
-            
-            st.success(f"🌟 **VIP Customers:** {vip_percentage:.1f}% of users generate {vip_order_percentage:.1f}% of orders")
-        else:
-            st.info("No data available. Please run ETL pipeline first.")
-    except Exception as e:
-        st.error(f"Error loading data: {str(e)}")
-    
-    # Basket Size Distribution
-    st.markdown("---")
-    st.subheader("🛒 Basket Size Distribution")
-    
-    try:
-        # Use cached function
-        df_basket = get_basket_distribution(engine)
-        
-        if not df_basket.empty:
-            fig = px.bar(
-                df_basket,
-                x='basket_size',
-                y='orders',
-                color='avg_reorder_rate',
-                color_continuous_scale='Viridis',
-                labels={
-                    'basket_size': 'Basket Size',
-                    'orders': 'Number of Orders',
-                    'avg_reorder_rate': 'Avg Reorder Rate (%)'
-                },
-                title='Order Distribution by Basket Size'
+        with detail_right:
+            insight_card(
+                "Segment shopping depth",
+                (
+                    f"The leading contribution segment averages "
+                    f"{strongest['avg_orders']:.1f} orders and "
+                    f"{strongest['avg_basket_size']:.1f} items per basket."
+                ),
             )
-            st.plotly_chart(fig, use_container_width=True)
-            
-            # Most common basket size
-            most_common = df_basket.loc[df_basket['orders'].idxmax()]
-            st.info(f"🛒 **Most Common Basket Size:** {most_common['basket_size']} with {int(most_common['orders']):,} orders")
-        else:
-            st.info("No data available. Please run ETL pipeline first.")
-    except Exception as e:
-        st.error(f"Error loading data: {str(e)}")
-    
-    # # Days Since Prior Order
-    # st.markdown("---")
-    # st.subheader("📅 Order Frequency Analysis")
-    
-    # try:
-    #     df_frequency = pd.read_sql("""
-    #         SELECT 
-    #             CASE 
-    #                 WHEN fo.days_since_prior = 0 THEN 'Same Day'
-    #                 WHEN fo.days_since_prior BETWEEN 1 AND 7 THEN '1-7 days'
-    #                 WHEN fo.days_since_prior BETWEEN 8 AND 14 THEN '8-14 days'
-    #                 WHEN fo.days_since_prior BETWEEN 15 AND 30 THEN '15-30 days'
-    #                 ELSE '30+ days'
-    #             END as frequency_group,
-    #             COUNT(*) as orders,
-    #             AVG(fo.total_items) as avg_basket
-    #         FROM Fact_Orders fo
-    #         WHERE fo.days_since_prior IS NOT NULL
-    #         GROUP BY frequency_group
-    #         ORDER BY MIN(fo.days_since_prior)
-    #     """, engine)
-        
-    #     if not df_frequency.empty:
-    #         fig = go.Figure()
-            
-    #         fig.add_trace(go.Bar(
-    #             x=df_frequency['frequency_group'],
-    #             y=df_frequency['orders'],
-    #             name='Orders',
-    #             marker_color='lightblue',
-    #             yaxis='y'
-    #         ))
-            
-    #         fig.add_trace(go.Scatter(
-    #             x=df_frequency['frequency_group'],
-    #             y=df_frequency['avg_basket'],
-    #             name='Avg Basket Size',
-    #             marker_color='red',
-    #             mode='lines+markers',
-    #             yaxis='y2'
-    #         ))
-            
-    #         fig.update_layout(
-    #             title='Order Frequency vs Basket Size',
-    #             xaxis=dict(title='Days Since Prior Order'),
-    #             yaxis=dict(title='Number of Orders', side='left'),
-    #             yaxis2=dict(title='Avg Basket Size', overlaying='y', side='right'),
-    #             legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
-    #             hovermode='x unified'
-    #         )
-            
-    #         st.plotly_chart(fig, use_container_width=True)
-            
-    #         # Loyal customer insight
-    #         loyal_orders = df_frequency[df_frequency['frequency_group'] == '1-7 days']['orders'].sum()
-    #         total_orders = df_frequency['orders'].sum()
-    #         loyal_percentage = (loyal_orders / total_orders) * 100
-            
-    #         st.success(f"💎 **Loyal Customers:** {loyal_percentage:.1f}% of repeat orders happen within 7 days")
-    #     else:
-    #         st.info("No data available. Please run ETL pipeline first.")
-    # except Exception as e:
-    #     st.error(f"Error loading data: {str(e)}")
+
+        st.dataframe(
+            segments,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "users": st.column_config.NumberColumn(format="%d"),
+                "total_orders": st.column_config.NumberColumn(format="%d"),
+                "avg_orders": st.column_config.NumberColumn(format="%.1f"),
+                "avg_basket_size": st.column_config.NumberColumn(format="%.1f"),
+                "user_share_pct": st.column_config.NumberColumn(format="%.1f%%"),
+                "order_share_pct": st.column_config.NumberColumn(format="%.1f%%"),
+            },
+        )
+        download_frame(
+            segments,
+            label="Download segment aggregate",
+            file_name="instacart-rule-based-segments.csv",
+            key="customers-download-segments",
+        )
+
+    st.subheader("Basket size distribution")
+    baskets = load_repository_data(
+        repository,
+        "basket_distribution",
+        loading_label="Loading basket distribution…",
+    )
+    basket_ok = require_columns(
+        baskets,
+        (
+            "bucket_order",
+            "basket_size",
+            "orders",
+            "avg_reorder_rate_pct",
+            "order_share_pct",
+        ),
+        context="Basket distribution",
+    )
+    if basket_ok:
+        baskets = baskets.sort_values("bucket_order").copy()
+        basket_chart = px.bar(
+            baskets,
+            x="basket_size",
+            y="orders",
+            color="avg_reorder_rate_pct",
+            color_continuous_scale=SEQUENTIAL_SCALE,
+            title="Orders by basket-size band",
+            labels={
+                "basket_size": "Basket size",
+                "orders": "Orders",
+                "avg_reorder_rate_pct": "Mean reorder ratio (%)",
+            },
+        )
+        basket_chart.update_traces(
+            hovertemplate=(
+                "%{x}<br>%{y:,.0f} orders"
+                "<br>Mean reorder ratio: %{marker.color:.1f}%<extra></extra>"
+            )
+        )
+        plotly_chart(
+            style_figure(basket_chart),
+            key="customers-basket-distribution",
+        )
+        common = baskets.loc[baskets["orders"].idxmax()]
+        insight_card(
+            "Most common basket band",
+            (
+                f"{common['basket_size']} accounts for "
+                f"{format_percent(common['order_share_pct'])} of orders "
+                f"({format_integer(common['orders'])} orders)."
+            ),
+        )
+        st.dataframe(
+            baskets,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "orders": st.column_config.NumberColumn(format="%d"),
+                "avg_reorder_rate_pct": st.column_config.NumberColumn(format="%.1f%%"),
+                "order_share_pct": st.column_config.NumberColumn(format="%.1f%%"),
+            },
+        )

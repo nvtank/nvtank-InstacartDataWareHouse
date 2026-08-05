@@ -1,327 +1,210 @@
-import streamlit as st
-import pandas as pd
+"""Shopping rhythm analysis using truthful normalized comparisons."""
+
+from __future__ import annotations
+
 import plotly.express as px
-import plotly.graph_objects as go
+import streamlit as st
 
-# Cached data loading functions
-@st.cache_data(ttl=86400, show_spinner="🔥 Loading heatmap data...")
-def get_heatmap_data(_engine):
-    """Get order heatmap data (cached for 30 minutes)"""
-    return pd.read_sql("""
-        SELECT 
-            t.order_dow,
-            t.dow_name,
-            t.order_hour,
-            COUNT(*) as orders
-        FROM Fact_Orders fo
-        INNER JOIN Dim_Time t ON fo.time_id = t.time_id
-        GROUP BY t.order_dow, t.dow_name, t.order_hour
-        ORDER BY t.order_dow, t.order_hour
-    """, _engine)
+from dashboard.components import (
+    download_frame,
+    format_integer,
+    format_percent,
+    insight_card,
+    load_repository_data,
+    page_header,
+    plotly_chart,
+    require_columns,
+)
+from dashboard.data import AnalyticsRepository
+from dashboard.styles import CATEGORICAL_PALETTE, COLORS, style_figure
 
-@st.cache_data(ttl=86400, show_spinner="� Loading weekend comparison...")
-def get_weekend_comparison(_engine):
-    """Get weekend vs weekday comparison (cached for 30 minutes)"""
-    return pd.read_sql("""
-        SELECT 
-            CASE WHEN t.is_weekend = 1 THEN 'Weekend' ELSE 'Weekday' END as day_type,
-            COUNT(DISTINCT fo.order_id) as orders,
-            AVG(fo.total_items) as avg_basket,
-            AVG(fo.reorder_ratio) * 100 as avg_reorder
-        FROM Fact_Orders fo
-        JOIN Dim_Time t ON fo.time_id = t.time_id
-        GROUP BY day_type
-    """, _engine)
 
-@st.cache_data(ttl=86400)
-def get_debug_data(_engine):
-    """Get debug information (cached for 30 minutes)"""
-    return pd.read_sql("""
-        SELECT 
-            fo.order_dow,
-            fo.time_id,
-            COUNT(*) as cnt,
-            COUNT(DISTINCT fo.time_id) as distinct_time_ids
-        FROM Fact_Orders fo
-        GROUP BY fo.order_dow
-        ORDER BY fo.order_dow
-    """, _engine)
+def show(repository: AnalyticsRepository) -> None:
+    page_header(
+        "Shopping rhythm",
+        (
+            "Understand recurring day-of-week and hour-of-day demand patterns. The "
+            "source has no calendar dates, so this page does not imply a dated trend."
+        ),
+        eyebrow="Demand timing",
+    )
 
-def show(engine):
-    st.header("⏰ Time Analysis")
-    st.markdown("Analyze temporal patterns and shopping behaviors")
-    
-    # Heatmap: Hour x Day of Week
-    st.subheader("🔥 Order Heatmap: Hour x Day of Week")
-    
-    try:
-        # Use cached functions
-        df_heatmap = get_heatmap_data(engine)
-        debug_df = get_debug_data(engine)
-        
-        if not df_heatmap.empty:
-            # Show debug info
-            with st.expander("🔍 Debug Information", expanded=False):
-                st.markdown("**Data Distribution by Day of Week:**")
-                st.dataframe(debug_df, use_container_width=True, hide_index=True)
-                st.markdown(f"**Total unique combinations:** {len(df_heatmap)}")
-                st.markdown(f"**Unique days:** {df_heatmap['order_dow'].nunique()}")
-                st.markdown(f"**Unique hours:** {df_heatmap['order_hour'].nunique()}")
-            
-            # Show data statistics
-            with st.expander("📊 Data Statistics & Raw Data", expanded=True):
-                col1, col2, col3, col4 = st.columns(4)
-                with col1:
-                    st.metric("Min Orders", f"{df_heatmap['orders'].min():,}")
-                with col2:
-                    st.metric("Max Orders", f"{df_heatmap['orders'].max():,}")
-                with col3:
-                    range_val = df_heatmap['orders'].max() - df_heatmap['orders'].min()
-                    st.metric("Range", f"{range_val:,.0f}")
-                with col4:
-                    st.metric("Std Dev", f"{df_heatmap['orders'].std():,.2f}")
-                
-                # Show raw data table
-                st.markdown("**Raw Data (First 20 rows):**")
-                st.dataframe(
-                    df_heatmap.head(20).style.background_gradient(subset=['orders'], cmap='YlOrRd'),
-                    use_container_width=True,
-                    hide_index=True
-                )
-                
-                # Show full pivot table
-                st.markdown("**Full Data Matrix:**")
-                pivot_display = df_heatmap.pivot(
-                    index='order_hour', 
-                    columns='dow_name', 
-                    values='orders'
-                )
-                day_order = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 
-                            'Thursday', 'Friday', 'Saturday']
-                pivot_display = pivot_display[[col for col in day_order if col in pivot_display.columns]]
-                st.dataframe(
-                    pivot_display.style.background_gradient(axis=None, cmap='YlOrRd'),
-                    use_container_width=True
-                )
-            
-            # Pivot for heatmap
-            pivot = df_heatmap.pivot(
-                index='order_hour', 
-                columns='dow_name', 
-                values='orders'
+    day = load_repository_data(
+        repository,
+        "day_trends",
+        loading_label="Loading day-of-week aggregates…",
+    )
+    hour = load_repository_data(
+        repository,
+        "hour_trends",
+        loading_label="Loading hour aggregates…",
+    )
+    comparison = load_repository_data(
+        repository,
+        "weekend_comparison",
+        loading_label="Loading normalized weekday comparison…",
+    )
+
+    day_ok = require_columns(
+        day,
+        ("order_dow", "dow_name", "orders", "share_pct"),
+        context="Day-of-week",
+    )
+    hour_ok = require_columns(
+        hour,
+        ("order_hour", "orders", "share_pct"),
+        context="Hour-of-day",
+    )
+
+    st.subheader("Recurring weekly pattern")
+    left, right = st.columns(2)
+    if day_ok:
+        with left:
+            day_chart = px.bar(
+                day.sort_values("order_dow"),
+                x="dow_name",
+                y="share_pct",
+                title="Share of orders by day",
+                labels={"dow_name": "Day", "share_pct": "Order share (%)"},
+                color_discrete_sequence=[COLORS["blue"]],
             )
-            
-            # Reorder columns to start from Sunday
-            day_order = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 
-                        'Thursday', 'Friday', 'Saturday']
-            pivot = pivot[[col for col in day_order if col in pivot.columns]]
-            
-            # Fill any NaN values with 0 (shouldn't happen, but just in case)
-            pivot = pivot.fillna(0)
-            
-            # Calculate statistics for better color scale
-            z_min = pivot.values.min()
-            z_max = pivot.values.max()
-            z_mean = pivot.values.mean()
-            z_std = pivot.values.std()
-            
-            # Use percentile-based scaling if range is too small
-            # This helps when all values are very close together
-            if (z_max - z_min) < z_mean * 0.01:  # If range is less than 1% of mean
-                # Use percentile-based bounds for better visualization
-                z_p5 = pd.DataFrame(pivot.values).quantile(0.05).iloc[0]
-                z_p95 = pd.DataFrame(pivot.values).quantile(0.95).iloc[0]
-                z_min_display = max(z_min, z_p5 - (z_p95 - z_p5) * 0.1)
-                z_max_display = min(z_max, z_p95 + (z_p95 - z_p5) * 0.1)
-                st.warning(f"⚠️ Data has very small range ({z_max - z_min:.1f}). Using enhanced color scale for better visualization.")
-            else:
-                z_min_display = z_min
-                z_max_display = z_max
-            
-            # Create heatmap with better color differentiation
-            fig = go.Figure(data=go.Heatmap(
-                z=pivot.values,
-                x=pivot.columns,
-                y=pivot.index,
-                colorscale=[
-                    [0, 'rgb(68,1,84)'],      # Dark purple (lowest)
-                    [0.1, 'rgb(59,82,139)'],   # Blue
-                    [0.3, 'rgb(33,144,140)'],  # Teal
-                    [0.5, 'rgb(92,200,99)'],   # Green
-                    [0.7, 'rgb(253,231,37)'], # Yellow
-                    [1, 'rgb(255,0,0)']        # Red (highest)
-                ],
-                zmin=z_min_display,
-                zmax=z_max_display,
-                colorbar=dict(
-                    title="Orders",
-                    tickformat=","
-                ),
-                hovertemplate='<b>%{x}</b><br>Hour: %{y}<br>Orders: %{z:,}<extra></extra>',
-                text=pivot.values,  # Show values on heatmap
-                texttemplate='%{text:,}',
-                textfont={"size": 9, "color": "white"}
-            ))
-            
-            fig.update_layout(
-                xaxis_title="Day of Week",
-                yaxis_title="Hour of Day",
-                height=700,
-                yaxis=dict(
-                    tickmode='linear', 
-                    tick0=0, 
-                    dtick=1,
-                    autorange='reversed'  # Reverse so hour 0 is at top
-                ),
-                xaxis=dict(side='bottom')
+            day_chart.update_traces(hovertemplate="%{x}<br>%{y:.1f}% of orders<extra></extra>")
+            plotly_chart(style_figure(day_chart), key="time-day-share")
+    if hour_ok:
+        with right:
+            hour_chart = px.line(
+                hour.sort_values("order_hour"),
+                x="order_hour",
+                y="share_pct",
+                markers=True,
+                title="Share of orders by hour",
+                labels={"order_hour": "Hour", "share_pct": "Order share (%)"},
+                color_discrete_sequence=[COLORS["primary"]],
             )
-            st.plotly_chart(fig, use_container_width=True)
-            
-            # Find peak and minimum times
-            peak_idx = df_heatmap['orders'].idxmax()
-            peak_row = df_heatmap.loc[peak_idx]
-            
-            min_idx = df_heatmap['orders'].idxmin()
-            min_row = df_heatmap.loc[min_idx]
-            
-            col1, col2 = st.columns(2)
-            with col1:
-                st.success(f"🔥 **Peak Time:** {peak_row['dow_name']} at {int(peak_row['order_hour']):02d}:00 with {int(peak_row['orders']):,} orders")
-            with col2:
-                st.info(f"❄️ **Lowest Time:** {min_row['dow_name']} at {int(min_row['order_hour']):02d}:00 with {int(min_row['orders']):,} orders")
-            
-            # Show top 5 and bottom 5 times
-            st.markdown("---")
-            col1, col2 = st.columns(2)
-            with col1:
-                st.markdown("**🔝 Top 5 Times:**")
-                top5 = df_heatmap.nlargest(5, 'orders')[['dow_name', 'order_hour', 'orders']]
-                top5['time'] = top5['dow_name'] + ' ' + top5['order_hour'].astype(str) + ':00'
-                st.dataframe(
-                    top5[['time', 'orders']].style.background_gradient(subset=['orders'], cmap='YlOrRd'),
-                    use_container_width=True,
-                    hide_index=True
+            hour_chart.update_traces(
+                line={"width": 3},
+                marker={"size": 6},
+                hovertemplate="%{x}:00<br>%{y:.1f}% of orders<extra></extra>",
+            )
+            hour_chart.update_xaxes(tickmode="linear", tick0=0, dtick=3)
+            plotly_chart(style_figure(hour_chart), key="time-hour-share")
+
+    if day_ok and hour_ok:
+        peak_day = day.loc[day["orders"].idxmax()]
+        quiet_day = day.loc[day["orders"].idxmin()]
+        peak_hour = hour.loc[hour["orders"].idxmax()]
+        insight_left, insight_right = st.columns(2)
+        with insight_left:
+            insight_card(
+                "Weekly concentration",
+                (
+                    f"{peak_day['dow_name']} is highest at {peak_day['share_pct']:.1f}% "
+                    f"of orders; {quiet_day['dow_name']} is lowest."
+                ),
+            )
+        with insight_right:
+            insight_card(
+                "Daily peak",
+                (
+                    f"The busiest recurring hour is "
+                    f"{int(peak_hour['order_hour']):02d}:00 with "
+                    f"{format_integer(peak_hour['orders'])} orders."
+                ),
+            )
+
+    st.subheader("Weekend versus weekday, normalized")
+    st.caption(
+        "Weekend covers two day categories and weekday covers five. "
+        "The primary comparison therefore uses average orders per day category, "
+        "while raw totals remain visible for auditability."
+    )
+    comparison_ok = require_columns(
+        comparison,
+        (
+            "day_type",
+            "orders",
+            "days_in_group",
+            "avg_orders_per_day",
+            "avg_basket_size",
+            "avg_reorder_rate_pct",
+        ),
+        context="Weekend comparison",
+    )
+    if comparison_ok:
+        normalized_chart = px.bar(
+            comparison,
+            x="day_type",
+            y="avg_orders_per_day",
+            color="day_type",
+            color_discrete_sequence=CATEGORICAL_PALETTE[:2],
+            title="Average orders per represented day",
+            labels={"day_type": "Day group", "avg_orders_per_day": "Average orders/day"},
+            text_auto=",.0f",
+        )
+        normalized_chart.update_layout(showlegend=False)
+        normalized_chart.update_traces(
+            hovertemplate="%{x}<br>%{y:,.0f} average orders/day<extra></extra>"
+        )
+        plotly_chart(
+            style_figure(normalized_chart, height=390),
+            key="time-weekend-normalized",
+        )
+
+        indexed = comparison.set_index("day_type")
+        weekend = indexed.loc["Weekend"] if "Weekend" in indexed.index else None
+        weekday = indexed.loc["Weekday"] if "Weekday" in indexed.index else None
+        if weekend is not None and weekday is not None:
+            baseline = float(weekday["avg_orders_per_day"])
+            difference = (
+                (float(weekend["avg_orders_per_day"]) / baseline - 1) * 100 if baseline else 0.0
+            )
+            comparison_left, comparison_right = st.columns(2)
+            with comparison_left:
+                insight_card(
+                    "Normalized traffic difference",
+                    (
+                        f"Weekend average daily traffic is {abs(difference):.1f}% "
+                        f"{'higher' if difference >= 0 else 'lower'} than weekday traffic."
+                    ),
                 )
-            with col2:
-                st.markdown("**🔻 Bottom 5 Times:**")
-                bottom5 = df_heatmap.nsmallest(5, 'orders')[['dow_name', 'order_hour', 'orders']]
-                bottom5['time'] = bottom5['dow_name'] + ' ' + bottom5['order_hour'].astype(str) + ':00'
-                st.dataframe(
-                    bottom5[['time', 'orders']].style.background_gradient(subset=['orders'], cmap='YlOrRd'),
-                    use_container_width=True,
-                    hide_index=True
+            with comparison_right:
+                insight_card(
+                    "Basket and reorder context",
+                    (
+                        f"Weekend basket size averages {weekend['avg_basket_size']:.1f} "
+                        f"items with a {format_percent(weekend['avg_reorder_rate_pct'])} "
+                        "mean reorder ratio."
+                    ),
                 )
-        else:
-            st.info("No data available. Please run ETL pipeline first.")
-    except Exception as e:
-        st.error(f"Error loading data: {str(e)}")
-        import traceback
-        st.code(traceback.format_exc())
-    
-    # Weekend vs Weekday
-    st.markdown("---")
-    st.subheader("📊 Weekend vs Weekday Comparison")
-    
-    try:
-        # Use cached function
-        df_comparison = get_weekend_comparison(engine)
-        
-        if not df_comparison.empty:
-            col1, col2, col3 = st.columns(3)
-            
-            with col1:
-                fig = px.bar(
-                    df_comparison, 
-                    x='day_type', 
-                    y='orders', 
-                    color='day_type', 
-                    color_discrete_sequence=['#636EFA', '#EF553B'],
-                    labels={'orders': 'Total Orders', 'day_type': ''}
-                )
-                fig.update_layout(showlegend=False, title="Total Orders")
-                st.plotly_chart(fig, use_container_width=True)
-            
-            with col2:
-                fig = px.bar(
-                    df_comparison, 
-                    x='day_type', 
-                    y='avg_basket',
-                    color='day_type', 
-                    color_discrete_sequence=['#636EFA', '#EF553B'],
-                    labels={'avg_basket': 'Avg Items', 'day_type': ''}
-                )
-                fig.update_layout(showlegend=False, title="Avg Basket Size")
-                st.plotly_chart(fig, use_container_width=True)
-            
-            with col3:
-                fig = px.bar(
-                    df_comparison, 
-                    x='day_type', 
-                    y='avg_reorder',
-                    color='day_type', 
-                    color_discrete_sequence=['#636EFA', '#EF553B'],
-                    labels={'avg_reorder': 'Reorder Rate (%)', 'day_type': ''}
-                )
-                fig.update_layout(showlegend=False, title="Avg Reorder Rate %")
-                st.plotly_chart(fig, use_container_width=True)
-            
-            # Comparison insights
-            weekday_df = df_comparison[df_comparison['day_type'] == 'Weekday']
-            weekend_df = df_comparison[df_comparison['day_type'] == 'Weekend']
-            
-            if not weekday_df.empty and not weekend_df.empty:
-                weekday_row = weekday_df.iloc[0]
-                weekend_row = weekend_df.iloc[0]
-                
-                order_diff = ((weekend_row['orders'] - weekday_row['orders']) / weekday_row['orders']) * 100
-                
-                if order_diff > 0:
-                    st.info(f"📈 Weekend orders are **{order_diff:.1f}%** higher than weekday orders")
-                else:
-                    st.info(f"📉 Weekday orders are **{abs(order_diff):.1f}%** higher than weekend orders")
-            else:
-                st.warning("⚠️ Cannot compare: Missing weekday or weekend data")
-        else:
-            st.info("No data available. Please run ETL pipeline first.")
-    except Exception as e:
-        st.error(f"Error loading data: {str(e)}")
-    
-    # # Hourly distribution by weekday/weekend
-    # st.markdown("---")
-    # st.subheader("📈 Hourly Order Distribution: Weekday vs Weekend")
-    
-    # try:
-    #     df_hourly = pd.read_sql("""
-    #         SELECT 
-    #             t.order_hour,
-    #             CASE WHEN t.is_weekend = 1 THEN 'Weekend' ELSE 'Weekday' END as day_type,
-    #             COUNT(*) as orders
-    #         FROM Fact_Orders fo
-    #         JOIN Dim_Time t ON fo.time_id = t.time_id
-    #         GROUP BY t.order_hour, day_type
-    #         ORDER BY t.order_hour
-    #     """, engine)
-        
-    #     if not df_hourly.empty:
-    #         fig = px.line(
-    #             df_hourly,
-    #             x='order_hour',
-    #             y='orders',
-    #             color='day_type',
-    #             markers=True,
-    #             labels={
-    #                 'order_hour': 'Hour of Day',
-    #                 'orders': 'Number of Orders',
-    #                 'day_type': 'Day Type'
-    #             }
-    #         )
-    #         fig.update_layout(
-    #             hovermode='x unified',
-    #             xaxis=dict(tickmode='linear', tick0=0, dtick=2),
-    #             legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1)
-    #         )
-    #         st.plotly_chart(fig, use_container_width=True)
-    #     else:
-    #         st.info("No data available. Please run ETL pipeline first.")
-    # except Exception as e:
-    #     st.error(f"Error loading data: {str(e)}")
+
+        st.dataframe(
+            comparison,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "orders": st.column_config.NumberColumn(format="%d"),
+                "avg_orders_per_day": st.column_config.NumberColumn(format="%.0f"),
+                "avg_basket_size": st.column_config.NumberColumn(format="%.2f"),
+                "avg_reorder_rate_pct": st.column_config.NumberColumn(format="%.1f%%"),
+            },
+        )
+
+    with st.expander("View and download timing aggregates"):
+        if day_ok:
+            st.markdown("#### Day-of-week data")
+            st.dataframe(day, width="stretch", hide_index=True)
+            download_frame(
+                day,
+                label="Download day data",
+                file_name="instacart-day-distribution.csv",
+                key="time-download-day",
+            )
+        if hour_ok:
+            st.markdown("#### Hour-of-day data")
+            st.dataframe(hour, width="stretch", hide_index=True)
+            download_frame(
+                hour,
+                label="Download hour data",
+                file_name="instacart-hour-distribution.csv",
+                key="time-download-hour",
+            )

@@ -30,7 +30,7 @@ dependencies = [
   "scikit-learn>=1.5,<2",
   "seaborn>=0.13,<1",
   "SQLAlchemy>=2.0,<3",
-  "streamlit>=1.39,<2",
+  "streamlit>=1.51,<2",
 ]
 
 [project.optional-dependencies]
