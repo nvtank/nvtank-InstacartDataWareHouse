@@ -1,57 +1,44 @@
-"""
-Quick script to update time_id in Fact_Order_Details
-Run this if ETL was interrupted during time_id update
-"""
+"""Recovery CLI for reconciling nullable detail time keys."""
+
+from __future__ import annotations
+
 import time
-from sqlalchemy import text
-from config import get_engine
+from dataclasses import dataclass
 
-def update_time_id_by_partition():
-    """Update time_id using partition-aware batching"""
-    print("="*60)
-    print("Updating time_id in Fact_Order_Details")
-    print("="*60)
-    
-    engine = get_engine()
-    
-    partitions = ['p0', 'p1', 'p2', 'p3', 'p4', 'p5', 'p6', 'p_max']
-    total_start = time.time()
-    
-    print(f"\nProcessing {len(partitions)} partitions...")
-    
-    for i, partition in enumerate(partitions, 1):
-        partition_start = time.time()
-        
-        try:
-            with engine.connect() as conn:
-                result = conn.execute(text(f"""
-                    UPDATE Fact_Order_Details PARTITION ({partition}) fod
-                    JOIN Fact_Orders fo ON fod.order_id = fo.order_id
-                    SET fod.time_id = fo.time_id
-                    WHERE fod.time_id = 0
-                """))
-                rows_affected = result.rowcount
-                conn.commit()
-                
-                partition_elapsed = time.time() - partition_start
-                print(f"  [{i}/{len(partitions)}] Partition {partition}: {rows_affected:,} rows updated in {partition_elapsed:.1f}s")
-                
-        except Exception as e:
-            print(f"  ✗ Error on partition {partition}: {e}")
-            continue
-    
-    total_elapsed = time.time() - total_start
-    print(f"\n✓ All partitions processed in {total_elapsed:.1f}s")
-    
-    # Verify
-    with engine.connect() as conn:
-        result = conn.execute(text("SELECT COUNT(*) FROM Fact_Order_Details WHERE time_id = 0"))
-        remaining = result.fetchone()[0]
-        
-        if remaining > 0:
-            print(f"⚠️  Warning: {remaining:,} rows still have time_id = 0")
-        else:
-            print("✓ All rows have valid time_id")
+from sqlalchemy.engine import Engine
 
-if __name__ == '__main__':
-    update_time_id_by_partition()
+from .config import get_engine
+from .load_facts import DETAIL_PARTITIONS
+from .load_facts import resolve_detail_time_ids as _resolve_detail_time_ids
+
+
+@dataclass(frozen=True, slots=True)
+class TimeResolutionResult:
+    rows_updated: int
+    partitions_processed: int
+    elapsed_seconds: float
+
+
+def resolve_detail_time_ids(engine: Engine) -> TimeResolutionResult:
+    """Delegate to the ETL resolver so load and recovery use one invariant."""
+    started = time.perf_counter()
+    with engine.connect() as connection:
+        rows_updated = _resolve_detail_time_ids(connection)
+    return TimeResolutionResult(
+        rows_updated=rows_updated,
+        partitions_processed=len(DETAIL_PARTITIONS),
+        elapsed_seconds=time.perf_counter() - started,
+    )
+
+
+def main() -> int:
+    result = resolve_detail_time_ids(get_engine())
+    print(
+        f"Resolved {result.rows_updated:,} rows across {result.partitions_processed} "
+        f"partitions in {result.elapsed_seconds:.1f}s."
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

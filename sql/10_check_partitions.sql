@@ -64,7 +64,7 @@ GROUP BY order_dow;
 EXPLAIN PARTITIONS
 SELECT COUNT(*)
 FROM Fact_Order_Details
-WHERE order_id BETWEEN 500000 AND 1500000;
+WHERE order_id >= 500000 AND order_id < 1500000;
 -- Expected: partitions: p1,p2
 
 -- ============================================

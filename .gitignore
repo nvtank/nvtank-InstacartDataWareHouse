@@ -131,3 +131,4 @@ nohup.out
 .mypy_cache/
 coverage.xml
 site/
+artifacts/

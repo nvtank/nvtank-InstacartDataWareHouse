@@ -1,7 +1,7 @@
 
 USE instacart_dwh;
 
-CREATE TABLE Dim_Aisle (
+CREATE TABLE IF NOT EXISTS Dim_Aisle (
     aisle_id INT PRIMARY KEY COMMENT 'Business key from source',
     aisle_name VARCHAR(100) NOT NULL,
     aisle_type VARCHAR(30) NOT NULL DEFAULT 'General'

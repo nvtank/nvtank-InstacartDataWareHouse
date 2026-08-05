@@ -1,102 +1,140 @@
-"""
-Update aggregated metrics in Fact_Orders
-- total_items: Count products per order
-- reorder_ratio: Average reorder rate per order
-"""
+"""Derive order- and customer-level metrics after fact loading."""
+
+from __future__ import annotations
+
 import time
+from dataclasses import dataclass
+
 from sqlalchemy import text
-import sys
-import os
+from sqlalchemy.engine import Engine
 
-# Add project root to path
-project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if project_root not in sys.path:
-    sys.path.insert(0, project_root)
+from .config import get_engine
 
-from etl.config import get_engine
 
-def update_fact_orders_metrics(engine):
-    """Update total_items and reorder_ratio in Fact_Orders"""
-    
-    print("\n[1/2] Updating total_items...")
-    print("   This will count products for each of 3.3M orders...")
-    start = time.time()
-    
-    with engine.connect() as conn:
-        # Update total_items (count products per order)
-        result = conn.execute(text("""
-            UPDATE Fact_Orders fo
-            SET total_items = (
-                SELECT COUNT(*)
-                FROM Fact_Order_Details fod
-                WHERE fod.order_id = fo.order_id
-            )
-        """))
-        rows_affected = result.rowcount
-        conn.commit()
-    
-    elapsed = time.time() - start
-    print(f"   ✅ Updated {rows_affected:,} orders in {elapsed:.1f}s ({rows_affected/elapsed:.0f} rows/sec)")
-    
-    print("\n[2/2] Updating reorder_ratio...")
-    print("   This will calculate average reorder rate per order...")
-    start = time.time()
-    
-    with engine.connect() as conn:
-        # Update reorder_ratio (average reorder rate per order)
-        result = conn.execute(text("""
-            UPDATE Fact_Orders fo
-            SET reorder_ratio = (
-                SELECT AVG(reordered)
-                FROM Fact_Order_Details fod
-                WHERE fod.order_id = fo.order_id
-            )
-        """))
-        rows_affected = result.rowcount
-        conn.commit()
-    
-    elapsed = time.time() - start
-    print(f"   ✅ Updated {rows_affected:,} orders in {elapsed:.1f}s ({rows_affected/elapsed:.0f} rows/sec)")
+class MetricUpdateError(RuntimeError):
+    """Raised when derived warehouse metrics fail reconciliation."""
 
-def main():
-    print("="*60)
-    print("Updating Fact_Orders Metrics")
-    print("="*60)
-    print("⚠️  This will take 5-10 minutes for 3.3M orders")
-    print("="*60)
-    
-    engine = get_engine()
-    print("✅ Database connection established")
-    
-    total_start = time.time()
-    update_fact_orders_metrics(engine)
-    total_elapsed = time.time() - total_start
-    
-    print("\n" + "="*60)
-    print("✅ All metrics updated!")
-    print(f"Total time: {total_elapsed:.1f}s")
-    print("="*60)
-    
-    # Verify
-    print("\nVerifying sample data:")
-    with engine.connect() as conn:
-        result = conn.execute(text("""
-            SELECT 
-                order_id, 
-                total_items, 
-                ROUND(reorder_ratio, 2) as reorder_ratio
-            FROM Fact_Orders
-            WHERE total_items > 0
-            LIMIT 5
-        """))
-        
-        print("\n  order_id | total_items | reorder_ratio")
-        print("  " + "-"*42)
-        for row in result:
-            print(f"  {row[0]:8d} | {row[1]:11d} | {row[2]:13.2f}")
-    
-    print("\n✅ Metrics updated successfully!")
-    print("\nNext: Re-run mining/recompute_cluster_profiles.py")
 
-if __name__ == '__main__':
-    main()
+@dataclass(frozen=True, slots=True)
+class MetricUpdateResult:
+    orders_updated: int
+    users_upserted: int
+    elapsed_seconds: float
+
+
+def update_fact_orders_metrics(engine: Engine) -> int:
+    """Populate both order metrics with one aggregation scan of the line-item fact."""
+    statement = text(
+        """
+        UPDATE Fact_Orders orders
+        JOIN (
+            SELECT
+                order_id,
+                COUNT(*) AS total_items,
+                AVG(reordered) AS reorder_ratio
+            FROM Fact_Order_Details
+            GROUP BY order_id
+        ) metrics ON orders.order_id = metrics.order_id
+        SET
+            orders.total_items = metrics.total_items,
+            orders.reorder_ratio = metrics.reorder_ratio
+        """
+    )
+    with engine.begin() as connection:
+        result = connection.execute(statement)
+    return max(result.rowcount or 0, 0)
+
+
+def populate_dim_users(engine: Engine) -> int:
+    """Build reproducible behavioral user attributes from fully reconciled orders."""
+    statement = text(
+        """
+        INSERT INTO Dim_User (
+            user_id,
+            user_segment,
+            first_order_dow,
+            avg_basket_size,
+            total_orders,
+            total_products_purchased,
+            avg_days_between_orders,
+            last_order_date_id
+        )
+        SELECT
+            user_id,
+            CASE
+                WHEN COUNT(*) >= 50 THEN 'VIP'
+                WHEN COUNT(*) >= 20 THEN 'Frequent'
+                WHEN COUNT(*) >= 10 THEN 'Regular'
+                ELSE 'New'
+            END AS user_segment,
+            MAX(CASE WHEN order_number = 1 THEN order_dow END) AS first_order_dow,
+            AVG(total_items) AS avg_basket_size,
+            COUNT(*) AS total_orders,
+            SUM(total_items) AS total_products_purchased,
+            AVG(days_since_prior_order) AS avg_days_between_orders,
+            CAST(
+                SUBSTRING_INDEX(
+                    GROUP_CONCAT(time_id ORDER BY order_number DESC), ',', 1
+                ) AS UNSIGNED
+            ) AS last_order_date_id
+        FROM Fact_Orders
+        GROUP BY user_id
+        ON DUPLICATE KEY UPDATE
+            user_segment = VALUES(user_segment),
+            first_order_dow = VALUES(first_order_dow),
+            avg_basket_size = VALUES(avg_basket_size),
+            total_orders = VALUES(total_orders),
+            total_products_purchased = VALUES(total_products_purchased),
+            avg_days_between_orders = VALUES(avg_days_between_orders),
+            last_order_date_id = VALUES(last_order_date_id)
+        """
+    )
+    with engine.begin() as connection:
+        result = connection.execute(statement)
+    return max(result.rowcount or 0, 0)
+
+
+def validate_derived_metrics(engine: Engine) -> None:
+    checks = {
+        "orders without line items": "SELECT COUNT(*) FROM Fact_Orders WHERE total_items <= 0",
+        "invalid reorder ratios": (
+            "SELECT COUNT(*) FROM Fact_Orders "
+            "WHERE reorder_ratio < 0 OR reorder_ratio > 1"
+        ),
+        "users without orders": "SELECT COUNT(*) FROM Dim_User WHERE total_orders <= 0",
+    }
+    failures: list[str] = []
+    with engine.connect() as connection:
+        for label, query in checks.items():
+            violations = int(connection.execute(text(query)).scalar_one())
+            if violations:
+                failures.append(f"{label}: {violations:,}")
+    if failures:
+        raise MetricUpdateError("Derived metric validation failed: " + "; ".join(failures))
+
+
+def update_all_metrics(engine: Engine) -> MetricUpdateResult:
+    started = time.perf_counter()
+    orders_updated = update_fact_orders_metrics(engine)
+    users_upserted = populate_dim_users(engine)
+    validate_derived_metrics(engine)
+    return MetricUpdateResult(
+        orders_updated=orders_updated,
+        users_upserted=users_upserted,
+        elapsed_seconds=time.perf_counter() - started,
+    )
+
+
+def main() -> int:
+    result = update_all_metrics(get_engine())
+    print(
+        "Derived metrics complete: "
+        f"{result.orders_updated:,} order rows updated, "
+        f"{result.users_upserted:,} user rows affected "
+        f"in {result.elapsed_seconds:.1f}s."
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

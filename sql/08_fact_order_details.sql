@@ -9,11 +9,12 @@
 
 USE instacart_dwh;
 
-CREATE TABLE Fact_Order_Details (
+CREATE TABLE IF NOT EXISTS Fact_Order_Details (
     detail_id BIGINT AUTO_INCREMENT COMMENT 'Surrogate key',
     order_id INT NOT NULL,
     product_id INT NOT NULL,
-    time_id INT NOT NULL,
+    time_id INT DEFAULT NULL
+        COMMENT 'Resolved from Fact_Orders after load; NULL means unresolved',
     add_to_cart_order SMALLINT NOT NULL 
         COMMENT 'Sequence in cart (1-N), max 32767',
     reordered BOOLEAN NOT NULL DEFAULT 0 
@@ -30,7 +31,11 @@ CREATE TABLE Fact_Order_Details (
     INDEX idx_order (order_id),
     INDEX idx_product (product_id),
     INDEX idx_time (time_id),
-    INDEX idx_reordered (reordered)
+    UNIQUE KEY uk_order_product (order_id, product_id),
+    INDEX idx_reordered (reordered),
+    CONSTRAINT chk_cart_position CHECK (add_to_cart_order > 0),
+    CONSTRAINT chk_reordered CHECK (reordered IN (0, 1)),
+    CONSTRAINT chk_quantity CHECK (quantity > 0)
 ) ENGINE=InnoDB
   COMMENT='Order line items fact table (33M+ records)'
   PARTITION BY RANGE (order_id) (
