@@ -134,6 +134,44 @@ partitioning, NULL semantics, and design tradeoffs.
 | Departments | Volume, reorder context, and normalized two-department comparison |
 | Warehouse explorer | Whitelisted schema, index, partition, storage, and lazy sample inspection |
 
+### Product tour
+
+#### Merchandising signals
+
+Rank products by distinct orders, retain reorder context, and filter the result by an
+exact department or literal product search.
+
+[![Products and aisles workspace](docs/assets/dashboard-products.png)](docs/assets/dashboard-products.png)
+
+#### Demand timing
+
+Recurring day/hour distributions are kept separate from dated trends. The weekend
+comparison is normalized per represented day so two weekend categories are not compared
+directly with five weekday categories.
+
+[![Shopping rhythm workspace](docs/assets/dashboard-shopping-rhythm.png)](docs/assets/dashboard-shopping-rhythm.png)
+
+#### Customer intelligence
+
+Customer reach and order contribution are shown together, making it visible when a small
+behavioral segment contributes a disproportionate share of orders.
+
+[![Customer segments workspace](docs/assets/dashboard-customer-segments.png)](docs/assets/dashboard-customer-segments.png)
+
+#### Portfolio allocation
+
+Department volume and weighted reorder behavior remain visually distinct, while the
+comparison view normalizes each metric independently instead of mixing incompatible units.
+
+[![Department performance workspace](docs/assets/dashboard-departments.png)](docs/assets/dashboard-departments.png)
+
+#### Warehouse transparency
+
+The explorer exposes schema, indexes, partitions, estimated storage, and opt-in samples for
+seven whitelisted tables without allowing arbitrary identifiers into SQL.
+
+[![Warehouse explorer workspace](docs/assets/dashboard-warehouse-explorer.png)](docs/assets/dashboard-warehouse-explorer.png)
+
 The UI uses bound query parameters, a fixed table whitelist, credential-free cache keys,
 sanitized infrastructure errors, CSV downloads, and visible data provenance. The ETL
 segments (`New`, `Regular`, `Frequent`, `VIP`) are intentionally separate from offline
@@ -200,7 +238,7 @@ plot artifacts are written under `mining/results/` and excluded from Git. See th
 .
 ├── analysis/            # Business SQL queries
 ├── dashboard/           # Repository contract, demo/live sources, and six UI pages
-├── docs/                # Architecture, data dictionary, screenshot, and CV brief
+├── docs/                # Architecture, data dictionary, dashboard gallery, and CV brief
 ├── etl/                 # Configuration, contracts, transforms, loaders, and pipeline
 ├── mining/              # Clustering, basket mining, artifacts, and recommendation
 ├── scripts/             # Isolated fixture integration workflow
