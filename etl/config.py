@@ -12,7 +12,10 @@ from dotenv import load_dotenv
 from sqlalchemy import URL, create_engine, text
 from sqlalchemy.engine import Engine
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PACKAGE_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(
+    os.environ.get("INSTACART_PROJECT_ROOT", str(PACKAGE_ROOT))
+).expanduser().resolve()
 load_dotenv(PROJECT_ROOT / ".env")
 
 SOURCE_FILES: Mapping[str, str] = {

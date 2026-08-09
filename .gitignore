@@ -62,7 +62,7 @@ etl_output.log
 *.log.*
 
 # Source data is downloaded separately from Kaggle and must never enter Git.
-data/
+/data/
 *.csv
 !docs/**/*.csv
 !tests/fixtures/**/*.csv
@@ -81,6 +81,7 @@ mining/results/
 *.jpg
 *.jpeg
 *.pdf
+!docs/assets/*.png
 mining/results/*.csv
 mining/results/*.png
 

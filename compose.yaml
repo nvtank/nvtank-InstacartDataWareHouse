@@ -1,0 +1,115 @@
+name: instacart-intelligence
+
+x-dashboard-base: &dashboard-base
+  build:
+    context: .
+    dockerfile: Dockerfile
+    target: runtime
+  image: instacart-intelligence-dashboard:local
+  init: true
+  restart: unless-stopped
+  ports:
+    - "${DASHBOARD_PORT:-8501}:8501"
+  environment:
+    DASHBOARD_CACHE_TTL: "${DASHBOARD_CACHE_TTL:-3600}"
+    STREAMLIT_SERVER_ADDRESS: "0.0.0.0"
+    STREAMLIT_SERVER_PORT: "8501"
+  healthcheck:
+    test:
+      - CMD
+      - python
+      - -c
+      - >-
+        import urllib.request;
+        urllib.request.urlopen('http://127.0.0.1:8501/_stcore/health', timeout=3)
+    interval: 10s
+    timeout: 5s
+    retries: 6
+    start_period: 20s
+
+x-live-environment: &live-environment
+  DB_HOST: mariadb
+  DB_PORT: "3306"
+  DB_USER: "${DB_USER:-instacart}"
+  DB_PASSWORD: "${DB_PASSWORD:-instacart-local}"
+  DB_NAME: "${DB_NAME:-instacart_dwh}"
+  DASHBOARD_CACHE_TTL: "${DASHBOARD_CACHE_TTL:-3600}"
+
+services:
+  dashboard-demo:
+    <<: *dashboard-base
+    profiles: [demo]
+    environment:
+      DASHBOARD_MODE: demo
+      DASHBOARD_CACHE_TTL: "${DASHBOARD_CACHE_TTL:-3600}"
+      STREAMLIT_SERVER_ADDRESS: "0.0.0.0"
+      STREAMLIT_SERVER_PORT: "8501"
+
+  dashboard-live:
+    <<: *dashboard-base
+    profiles: [live]
+    environment:
+      <<: *live-environment
+      DASHBOARD_MODE: live
+      STREAMLIT_SERVER_ADDRESS: "0.0.0.0"
+      STREAMLIT_SERVER_PORT: "8501"
+    depends_on:
+      mariadb:
+        condition: service_healthy
+
+  mariadb:
+    image: mariadb:11.4.5
+    profiles: [live]
+    restart: unless-stopped
+    ports:
+      - "${DB_PORT:-3307}:3306"
+    environment:
+      MARIADB_DATABASE: "${DB_NAME:-instacart_dwh}"
+      MARIADB_USER: "${DB_USER:-instacart}"
+      MARIADB_PASSWORD: "${DB_PASSWORD:-instacart-local}"
+      MARIADB_ROOT_PASSWORD: "${MARIADB_ROOT_PASSWORD:-instacart-root-local}"
+    volumes:
+      - mariadb_data:/var/lib/mysql
+      - ./sql/01_create_database.sql:/docker-entrypoint-initdb.d/01_create_database.sql:ro
+      - ./sql/02_dim_time.sql:/docker-entrypoint-initdb.d/02_dim_time.sql:ro
+      - ./sql/03_dim_department.sql:/docker-entrypoint-initdb.d/03_dim_department.sql:ro
+      - ./sql/04_dim_aisle.sql:/docker-entrypoint-initdb.d/04_dim_aisle.sql:ro
+      - ./sql/05_dim_product.sql:/docker-entrypoint-initdb.d/05_dim_product.sql:ro
+      - ./sql/06_dim_user.sql:/docker-entrypoint-initdb.d/06_dim_user.sql:ro
+      - ./sql/07_fact_orders.sql:/docker-entrypoint-initdb.d/07_fact_orders.sql:ro
+      - ./sql/08_fact_order_details.sql:/docker-entrypoint-initdb.d/08_fact_order_details.sql:ro
+      - ./sql/09_additional_indexes.sql:/docker-entrypoint-initdb.d/09_additional_indexes.sql:ro
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          MYSQL_PWD="$${MARIADB_PASSWORD}"
+          mariadb --protocol=socket --user="$${MARIADB_USER}"
+          --database="$${MARIADB_DATABASE}" --silent --skip-column-names
+          --execute='SELECT 1 FROM Dim_Time LIMIT 1' >/dev/null
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  etl:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    image: instacart-intelligence-dashboard:local
+    profiles: [tools]
+    entrypoint: ["instacart-etl"]
+    environment:
+      <<: *live-environment
+      DATA_PATH: /app/data
+      BATCH_SIZE: "${BATCH_SIZE:-1000}"
+      CHUNK_SIZE: "${CHUNK_SIZE:-50000}"
+    volumes:
+      - ./data:/app/data:ro
+    depends_on:
+      mariadb:
+        condition: service_healthy
+
+volumes:
+  mariadb_data:

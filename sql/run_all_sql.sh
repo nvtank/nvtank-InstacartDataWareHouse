@@ -1,99 +1,98 @@
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
+#!/usr/bin/env bash
 
-# Database credentials
-DB_HOST="localhost"
-DB_PORT="3307"
-DB_USER="dwh_user"
-DB_PASS="dwh_pass123"
-DB_NAME="instacart_dwh"
+set -Eeuo pipefail
+IFS=$'\n\t'
 
-# Get script directory
-SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-cd "$SCRIPT_DIR"
+readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+readonly PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+readonly TOTAL_STEPS=11
+readonly -a COMPOSE=(
+    docker compose
+    --project-directory "$PROJECT_ROOT"
+    --profile live
+)
 
-echo -e "${YELLOW}================================${NC}"
-echo -e "${YELLOW}Instacart DWH Setup${NC}"
-echo -e "${YELLOW}================================${NC}"
-echo -e "Script dir: ${SCRIPT_DIR}"
-
-# Check if MariaDB is running
-echo -e "\n${YELLOW}[1/11] Checking MariaDB connection...${NC}"
-if docker exec instacart-mariadb mariadb -uroot -proot123 -e "SELECT 1" > /dev/null 2>&1; then
-    echo -e "${GREEN}✓ MariaDB is running${NC}"
-else
-    echo -e "${RED}✗ Cannot connect to MariaDB. Is the container running?${NC}"
-    echo -e "${YELLOW}Try: docker start instacart-mariadb${NC}"
+die() {
+    printf 'error: %s\n' "$*" >&2
     exit 1
-fi
-
-# Function to execute SQL file
-execute_sql() {
-    local file=$1
-    local description=$2
-    local step=$3
-    local use_root=$4
-    
-    echo -e "\n${YELLOW}[${step}/11] ${description}${NC}"
-    echo -e "Executing: ${file}"
-    
-    # Check file exists
-    if [ ! -f "$file" ]; then
-        echo -e "${RED}✗ File not found: ${file}${NC}"
-        exit 1
-    fi
-    
-    # Execute SQL
-    if [ "$use_root" = "true" ]; then
-        if docker exec -i instacart-mariadb mariadb -uroot -proot123 < "$file" 2>&1 | grep -v "Warning: Using a password"; then
-            echo -e "${GREEN}✓ Success${NC}"
-        else
-            echo -e "${RED}✗ Failed to execute ${file}${NC}"
-            exit 1
-        fi
-    else
-        if docker exec -i instacart-mariadb mariadb -u${DB_USER} -p${DB_PASS} ${DB_NAME} < "$file" 2>&1 | grep -v "Warning: Using a password"; then
-            echo -e "${GREEN}✓ Success${NC}"
-        else
-            echo -e "${RED}✗ Failed to execute ${file}${NC}"
-            exit 1
-        fi
-    fi
 }
 
-# Execute SQL files in order
-execute_sql "01_create_database.sql" "Creating database" "2" "true"
-execute_sql "02_dim_time.sql" "Creating Dim_Time (168 rows)" "3" "false"
-execute_sql "03_dim_department.sql" "Creating Dim_Department" "4" "false"
-execute_sql "04_dim_aisle.sql" "Creating Dim_Aisle" "5" "false"
-execute_sql "05_dim_product.sql" "Creating Dim_Product" "6" "false"
-execute_sql "06_dim_user.sql" "Creating Dim_User" "7" "false"
-execute_sql "07_fact_orders.sql" "Creating Fact_Orders (LIST partitioned)" "8" "false"
-execute_sql "08_fact_order_details.sql" "Creating Fact_Order_Details (RANGE partitioned)" "9" "false"
-execute_sql "09_additional_indexes.sql" "Creating indexes" "10" "false"
+on_error() {
+    local exit_code=$?
+    printf 'error: schema setup failed at line %s\n' "$1" >&2
+    exit "$exit_code"
+}
+trap 'on_error "$LINENO"' ERR
 
-echo -e "\n${YELLOW}[11/11] Verifying schema...${NC}"
-docker exec instacart-mariadb mariadb -u${DB_USER} -p${DB_PASS} -D${DB_NAME} -e "SHOW TABLES;" 2>&1 | grep -v "Warning: Using a password"
+command -v docker >/dev/null 2>&1 || die "Docker is required to apply the schema."
 
-echo -e "\n${YELLOW}Checking partitions...${NC}"
-docker exec instacart-mariadb mariadb -u${DB_USER} -p${DB_PASS} -D${DB_NAME} -e "
-SELECT TABLE_NAME, PARTITION_NAME, PARTITION_METHOD 
-FROM INFORMATION_SCHEMA.PARTITIONS 
-WHERE TABLE_SCHEMA = '${DB_NAME}' 
-  AND PARTITION_NAME IS NOT NULL 
-ORDER BY TABLE_NAME, PARTITION_ORDINAL_POSITION;
-" 2>&1 | grep -v "Warning: Using a password"
+readonly CONTAINER_ID="$("${COMPOSE[@]}" ps --status running --quiet mariadb)"
+[[ -n "$CONTAINER_ID" ]] || die "MariaDB is not running. Run 'make db' first."
 
-echo -e "\n${GREEN}================================${NC}"
-echo -e "${GREEN}✓ Database schema created successfully!${NC}"
-echo -e "${GREEN}================================${NC}"
-echo -e "\n${YELLOW}Next steps:${NC}"
-echo -e "1. Check .env file: cat ../.env"
-echo -e "2. Run ETL: cd .. && python etl/etl_pipeline.py"
-echo -e "3. Run dashboard: ./run_dashboard.sh"
-echo -e "4. Run mining: ./run_mining.sh all"
-echo -e "2. Check partitions: mysql < sql/10_check_partitions.sql"
-echo -e "3. Run maintenance: mysql < sql/11_maintenance.sql"
-echo -e "4. Add indexes: mysql < sql/09_additional_indexes.sql"
+run_root_client() {
+    "${COMPOSE[@]}" exec --no-TTY mariadb sh -ec '
+        : "${MARIADB_ROOT_PASSWORD:?MARIADB_ROOT_PASSWORD is not configured}"
+        MYSQL_PWD="$MARIADB_ROOT_PASSWORD" exec mariadb \
+            --protocol=socket \
+            --user=root
+    '
+}
+
+run_app_client() {
+    "${COMPOSE[@]}" exec --no-TTY mariadb sh -ec '
+        : "${MARIADB_USER:?MARIADB_USER is not configured}"
+        : "${MARIADB_PASSWORD:?MARIADB_PASSWORD is not configured}"
+        : "${MARIADB_DATABASE:?MARIADB_DATABASE is not configured}"
+        MYSQL_PWD="$MARIADB_PASSWORD" exec mariadb \
+            --protocol=socket \
+            --user="$MARIADB_USER" \
+            --database="$MARIADB_DATABASE"
+    '
+}
+
+readonly -a SCHEMA_FILES=(
+    "01_create_database.sql"
+    "02_dim_time.sql"
+    "03_dim_department.sql"
+    "04_dim_aisle.sql"
+    "05_dim_product.sql"
+    "06_dim_user.sql"
+    "07_fact_orders.sql"
+    "08_fact_order_details.sql"
+    "09_additional_indexes.sql"
+)
+
+printf '[1/%d] Checking MariaDB connectivity\n' "$TOTAL_STEPS"
+if ! run_root_client <<<"SELECT 1;" >/dev/null; then
+    die "MariaDB rejected the container-managed root credentials."
+fi
+
+step=2
+for file_name in "${SCHEMA_FILES[@]}"; do
+    file_path="${SCRIPT_DIR}/${file_name}"
+    [[ -f "$file_path" ]] || die "SQL file not found: $file_path"
+    printf '[%d/%d] Applying %s\n' "$step" "$TOTAL_STEPS" "$file_name"
+    if [[ "$file_name" == "01_create_database.sql" ]]; then
+        run_root_client <"$file_path"
+    else
+        run_app_client <"$file_path"
+    fi
+    ((step += 1))
+done
+
+printf '[11/%d] Verifying required tables and partitions\n' "$TOTAL_STEPS"
+run_app_client <<'SQL'
+SELECT TABLE_NAME
+FROM INFORMATION_SCHEMA.TABLES
+WHERE TABLE_SCHEMA = DATABASE()
+ORDER BY TABLE_NAME;
+
+SELECT TABLE_NAME, COUNT(*) AS partition_count
+FROM INFORMATION_SCHEMA.PARTITIONS
+WHERE TABLE_SCHEMA = DATABASE()
+  AND PARTITION_NAME IS NOT NULL
+GROUP BY TABLE_NAME
+ORDER BY TABLE_NAME;
+SQL
+
+printf 'Warehouse schema is ready. Next: make etl\n'
