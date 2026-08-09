@@ -1,192 +1,142 @@
-# 🛒 Instacart Analytics Dashboard
+# Analytics dashboard
 
-Interactive Streamlit dashboard for analyzing Instacart Data Warehouse insights.
+This directory contains the Streamlit presentation layer for the Instacart warehouse. Every page reads through the same `AnalyticsRepository` contract, so the UI can run against a deterministic demo fixture or the loaded MariaDB warehouse without page-specific connection logic.
 
-## Features
+## Quick start
 
-### 📊 Overview Dashboard
-- **KPI Cards:** Total orders, users, products, average basket size
-- **Day of Week Analysis:** Order distribution across weekdays
-- **Department Market Share:** Interactive pie chart showing top 10 departments
-- **Hourly Trends:** Peak shopping hours visualization
-
-### 🏆 Product Analytics
-- **Top 20 Products:** Best-selling items with reorder rates
-- **Aisle Analysis:** Reorder patterns by product aisle
-- **Product Search:** Find and analyze specific products
-- **Color-coded Metrics:** Reorder rates shown with heatmap colors
-
-### ⏰ Time Analysis
-- **Order Heatmap:** Hour x Day of Week visualization
-- **Weekend vs Weekday:** Comparative behavior analysis
-- **Hourly Patterns:** Separate trends for weekday/weekend
-- **Peak Time Detection:** Automatic highlighting of busiest times
-
-### 👥 Customer Analytics
-- **Segmentation:** VIP (50+ orders), Regular (10-49), New (1-9)
-- **Basket Size Distribution:** Order size grouping and analysis
-- **Order Frequency:** Days since prior order patterns
-- **Customer Insights:** Loyalty metrics and retention indicators
-
-### 🏪 Department Performance
-- **Sales Volume:** Total items sold by department
-- **Reorder Rate Comparison:** Department-level loyalty metrics
-- **Market Share:** Percentage breakdown of sales
-- **Department Comparison Tool:** Side-by-side radar chart analysis
-
-## Installation
+The demo profile needs Docker with Compose, but it does not need the source CSV files or a database:
 
 ```bash
-# 1. Activate virtual environment
-source venv/bin/activate
-
-# 2. Install dashboard dependencies
-pip install -r requirements.txt
-# or
-pip install streamlit plotly
-
-# 3. Ensure database is running
-docker start instacart-mariadb
-
-# 4. Run ETL if not already done
-python etl/etl_pipeline.py
+make demo-detached
 ```
 
-## Usage
+Open <http://localhost:8501>. Use `make logs` to follow the containers and `make down` to stop them. The MariaDB volume is preserved by `make down`.
 
-### Quick Start
+For a local Python process instead:
+
 ```bash
-# Run dashboard with helper script
+make install
+DASHBOARD_MODE=demo ./run_dashboard.sh
+```
+
+`run_dashboard.sh` selects `.venv`, `venv`, an active virtual environment, or `python3` in that order. Override the bind address or port when needed:
+
+```bash
+STREAMLIT_SERVER_ADDRESS=0.0.0.0 \
+STREAMLIT_SERVER_PORT=8502 \
+DASHBOARD_MODE=demo \
 ./run_dashboard.sh
 ```
 
-### Manual Start
+## Data-source modes
+
+Set `DASHBOARD_MODE` in the process environment or `.env`.
+
+| Mode | Behaviour |
+| --- | --- |
+| `demo` | Uses the deterministic representative aggregate fixture in `dashboard/demo_data.py`. No database connection is created. |
+| `live` | Uses read-only aggregate queries against MariaDB. Startup fails closed if the connection, required schema, segment column, or minimum fact/user data checks fail. |
+| `auto` | Attempts the same live readiness check and falls back to demo data with a sanitized reason when the warehouse is unavailable or incomplete. |
+
+The source badge at the top of the UI always identifies the active source. An `auto` fallback is therefore visible and must not be interpreted as a successful live connection.
+
+### Run against the warehouse
+
+Place the six source CSV files under `./data`, configure non-production credentials, load the warehouse, and start the live profile:
+
 ```bash
-streamlit run dashboard/app.py
+cp .env.example .env
+# Edit .env before continuing.
+make etl
+make live-detached
 ```
 
-Dashboard will open at: **http://localhost:8501**
+`make etl` starts MariaDB, applies the warehouse schema, and runs the packaged `instacart-etl` command. `make live-detached` requires that load to have completed and exposes the dashboard at <http://localhost:8501> by default.
 
-## Project Structure
+To connect a local Streamlit process to an already loaded database, set `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, and `DB_NAME` in `.env`, then run:
 
-```
-dashboard/
-├── app.py                      # Main Streamlit app with routing
-├── pages/                      # Dashboard pages
-│   ├── __init__.py
-│   ├── overview.py            # KPI metrics & overall trends
-│   ├── products.py            # Product analysis & search
-│   ├── time_analysis.py       # Temporal patterns & heatmaps
-│   ├── customers.py           # Segmentation & behavior
-│   └── departments.py         # Department performance
-└── README.md                  # This file
-```
-
-## Key Visualizations
-
-### Chart Types Used
-- **Bar Charts:** Product rankings, department performance
-- **Line Charts:** Hourly trends, temporal patterns
-- **Pie Charts:** Market share, customer segments
-- **Heatmaps:** Hour x Day order density
-- **Scatter Plots:** Volume vs reorder rate correlation
-- **Radar Charts:** Multi-metric department comparison
-
-### Interactive Features
-- **Filters:** Search products, select time periods
-- **Tooltips:** Hover for detailed metrics
-- **Drill-down:** Click to explore specific segments
-- **Comparison Tools:** Side-by-side department analysis
-
-## Database Connection
-
-Dashboard uses `etl/config.py` for database connection:
-
-```python
-# Connects to: mariadb://dwh_user@localhost:3307/instacart_dwh
-# Credentials loaded from .env file
-```
-
-Ensure `.env` file exists with:
-```
-DB_HOST=localhost
-DB_PORT=3307
-DB_USER=dwh_user
-DB_PASSWORD=your_password
-DB_NAME=instacart_dwh
-```
-
-## Performance Notes
-
-- **Data Caching:** Uses `@st.cache_resource` for connection pooling
-- **Query Optimization:** Indexed queries with partition pruning
-- **Lazy Loading:** Charts load only when page is active
-- **Error Handling:** Graceful fallback if data not yet loaded
-
-## Screenshots
-
-### Overview Page
-```
-┌──────────────────────────────────────────────────┐
-│  3.4M Orders │ 206K Users │ 49K Products │ 10.1  │
-└──────────────────────────────────────────────────┘
-📅 Bar Chart: Orders by Day of Week
-🏪 Pie Chart: Department Market Share
-⏰ Line Chart: Hourly Order Trends with Peak Highlight
-```
-
-### Time Analysis Heatmap
-```
-🔥 Heatmap showing peak: Sunday 10AM, Monday 2PM
-📊 Comparison: Weekend orders 15% higher than weekday
-```
-
-### Customer Segmentation
-```
-🎯 VIP: 8.3% of users generate 42.1% of orders
-🛒 Most common basket: 6-10 items (35.2% of orders)
-💎 51.3% of repeat orders within 7 days
-```
-
-## Troubleshooting
-
-### Dashboard won't start
 ```bash
-# Check if port 8501 is available
-lsof -i :8501
-
-# Or specify different port
-streamlit run dashboard/app.py --server.port 8502
+DASHBOARD_MODE=live ./run_dashboard.sh
 ```
 
-### No data showing
+Live readiness requires these seven tables:
+
+- `Dim_Time`
+- `Dim_Department`
+- `Dim_Aisle`
+- `Dim_Product`
+- `Dim_User`
+- `Fact_Orders`
+- `Fact_Order_Details`
+
+It also requires `Dim_User.user_segment` and at least one row in `Dim_User`, `Fact_Orders`, and `Fact_Order_Details`.
+
+## Six analysis workspaces
+
+| Workspace | What it shows |
+| --- | --- |
+| Executive overview | Snapshot KPIs, recurring day-of-week and hour-of-day patterns, and item share across all departments. The chart shows the top eight departments plus a weighted “All other departments” row. |
+| Products & aisles | Product rankings, exact department filtering, a literal client-side search over up to 100 loaded top products, and aisle reorder rates with an explicit minimum line-item support filter. |
+| Shopping rhythm | Day and hour distributions plus weekend-versus-weekday behaviour. The primary traffic comparison divides raw totals by the two represented weekend days or five represented weekdays. |
+| Customer segments | Customer share, order contribution, and basket-size bands using the rule-based segment stored in `Dim_User.user_segment`. |
+| Departments | Department volume and reorder context, plus a two-department comparison. Each comparison metric is divided by the highest department value for that metric; the raw-unit table remains visible. |
+| Warehouse explorer | Schema, indexes, partitions, estimated storage, and optional row samples for one whitelisted warehouse table at a time. The UI loads 5–25 sample rows only after explicit confirmation. |
+
+Most analytical tables can be downloaded as CSV from the relevant page.
+
+## Customer segment contract
+
+The dashboard uses deterministic rules produced by the ETL pipeline:
+
+| Segment | Lifetime order count |
+| --- | ---: |
+| `VIP` | 50 or more |
+| `Frequent` | 20–49 |
+| `Regular` | 10–19 |
+| `New` | Fewer than 10 |
+
+These labels are not the K-Means assignments generated by `instacart-cluster`. The current dashboard does not read `mining/results/cluster_labels.csv`; see `mining/README.md` for that separate experiment and its artifacts.
+
+## Architecture and safety boundaries
+
+```text
+dashboard/app.py
+  -> dashboard/pages/*
+  -> dashboard/components.py
+  -> AnalyticsRepository
+       -> DemoAnalyticsRepository
+       -> MariaDBAnalyticsRepository
+```
+
+- Page code requests typed aggregate frames rather than embedding SQL.
+- The live repository issues read-only analytical queries.
+- Repository failures are logged server-side and rendered as sanitized UI states.
+- Query results are cached for 15 minutes. **Refresh snapshot** clears cached query results and rebuilds the repository resource.
+- The explorer accepts only the seven fixed table names above. Its repository sample limit is capped at 100 rows even though the UI currently exposes at most 25.
+- MariaDB row counts and storage values shown by the explorer come from `information_schema` estimates, not exact `COUNT(*)` queries.
+
+## Verification
+
+After `make install`, run the dashboard-specific offline tests:
+
 ```bash
-# Verify database has data
-docker exec instacart-mariadb mariadb -u dwh_user -p instacart_dwh \
-  -e "SELECT COUNT(*) FROM Fact_Orders;"
+DASHBOARD_MODE=demo .venv/bin/python -m pytest \
+  tests/test_dashboard_data.py \
+  tests/test_dashboard_app.py
 
-# If empty, run ETL
-python etl/etl_pipeline.py
+.venv/bin/python -m ruff check \
+  dashboard \
+  tests/test_dashboard_data.py \
+  tests/test_dashboard_app.py
 ```
 
-### Import errors
-```bash
-# Reinstall dependencies
-pip install --upgrade streamlit plotly pandas
-```
+The Streamlit smoke test opens the app in demo mode and navigates all six workspaces without requiring MariaDB.
 
-## Next Steps
+## Known limitations
 
-After exploring the dashboard:
-1. **Chapter 7 - Data Mining:** Customer clustering & product recommendations
-2. **Deploy to Cloud:** Streamlit Cloud (free hosting)
-3. **Add Authentication:** Streamlit-authenticator for user login
-4. **Schedule Updates:** Automate ETL with cron jobs
-
-## Credits
-
-Built with:
-- [Streamlit](https://streamlit.io/) - Web framework
-- [Plotly](https://plotly.com/) - Interactive charts
-- [Pandas](https://pandas.pydata.org/) - Data manipulation
-- [SQLAlchemy](https://www.sqlalchemy.org/) - Database ORM
+- The public source contains day-of-week and hour-of-day fields, not calendar dates. The dashboard presents recurring distributions, not dated trends or seasonality.
+- Demo mode contains fixed representative aggregates for UI evaluation. Its values are not live query results or benchmark evidence.
+- The warehouse is a batch-loaded snapshot; the dashboard has no streaming ingestion or real-time freshness guarantee.
+- Authentication and per-user authorization are outside the current Streamlit layer.
+- `auto` mode prioritizes availability by falling back to demo data. Use `live` when a failed warehouse connection must stop the application.
+- The customer page exposes ETL rules only. K-Means clusters are separate offline artifacts and are not yet integrated into the UI.

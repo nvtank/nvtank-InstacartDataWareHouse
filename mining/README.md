@@ -1,348 +1,197 @@
-# 🔍 Data Mining Module
+# Data-mining and recommendation lab
 
-Advanced analytics for customer segmentation and product recommendations.
+This module provides three command-line workflows over the loaded Instacart warehouse:
 
-## Overview
+1. reproducible K-Means customer clustering;
+2. deterministic, bounded-by-default market-basket mining with FP-Growth or Apriori;
+3. exact-set association-rule and cluster-popularity recommendation fused by weighted reciprocal rank.
 
-This module implements two key data mining techniques:
+The commands write local experiment artifacts. They do not train during dashboard startup, serve an online API, or modify warehouse tables.
 
-1. **Customer Clustering (K-Means)** - Segment customers by behavior
-2. **Market Basket Analysis (Apriori/FP-Growth)** - Discover product associations
-3. **Product Recommendations** - Hybrid recommendation system
+## Prerequisites
 
----
-
-## Features
-
-### 🤖 Customer Clustering
-
-**Algorithm:** K-Means with Elbow Method
-
-**Features Used:**
-- Total orders
-- Average basket size
-- Average reorder ratio
-- Days between orders
-
-**Outputs:**
-- Elbow curve for optimal K selection
-- PCA 2D/3D cluster visualizations
-- Cluster profiles with statistics
-- User-cluster assignments (CSV)
-
-**Expected Clusters:**
-- **VIP Customers** (50+ orders) - Loyalty programs
-- **Frequent Shoppers** (20-49 orders) - Cross-sell opportunities
-- **Regular Customers** (10-19 orders) - Upselling campaigns
-- **Occasional Buyers** (3-9 orders) - Re-engagement strategies
-
-### 🛒 Market Basket Analysis
-
-**Algorithm:** FP-Growth (faster than Apriori)
-
-**Parameters:**
-- `min_support = 0.01` (1% of transactions)
-- `min_confidence = 0.3` (30% confidence)
-
-**Outputs:**
-- Frequent itemsets (CSV)
-- Association rules with support/confidence/lift
-- Rule visualizations (scatter plots, histograms)
-
-**Key Metrics:**
-- **Support:** P(A ∩ B) - Frequency of co-occurrence
-- **Confidence:** P(B|A) - Probability of B given A
-- **Lift:** P(B|A) / P(B) - Strength of association (>1 = positive)
-
-### 🎯 Product Recommendations
-
-**Strategies:**
-1. **Rule-based:** Cart items → Association rules → Recommendations
-2. **Cluster-based:** User segment → Popular products in cluster
-3. **Hybrid:** Weighted combination (60% rules + 40% cluster)
-
-**Use Cases:**
-- Cart page: "Customers who bought X also bought Y"
-- Homepage: "Popular in your segment"
-- Checkout: "Complete your order with these items"
-
----
-
-## Installation
+Install the project and load the seven-table warehouse before running any mining command:
 
 ```bash
-# Install dependencies
-pip install -r requirements.txt
-
-# Or specific packages
-pip install scikit-learn matplotlib seaborn mlxtend
+make install
+cp .env.example .env
+# Edit .env and place the six source CSV files under ./data.
+make etl
+source .venv/bin/activate
 ```
 
-**Required packages:**
-- `scikit-learn` - K-Means, PCA
-- `matplotlib` - Visualizations
-- `seaborn` - Statistical plots
-- `mlxtend` - Apriori, FP-Growth algorithms
+The commands read `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, and `DB_NAME` through the shared ETL configuration. Their default output directory is `mining/results/`, which is intentionally ignored by Git.
 
----
+## Quick commands
 
-## Usage
-
-### Quick Start - Run All
+Run deterministic clustering without rendering plots:
 
 ```bash
-./run_mining.sh all
+instacart-cluster --max-k 10 --silhouette-sample-size 10000 --no-plots
 ```
 
-### Individual Tasks
+Mine a deterministic sample of at most 100,000 complete orders, restricted to the 2,000 most frequent products:
 
 ```bash
-# Customer clustering only
-./run_mining.sh clustering
-
-# Market basket analysis only
-./run_mining.sh basket
-
-# Recommendation demo only
-./run_mining.sh recommend
+instacart-basket \
+  --order-limit 100000 \
+  --top-products 2000 \
+  --min-support 0.01 \
+  --min-confidence 0.3 \
+  --no-plot
 ```
 
-### Python Scripts
+After both commands have produced artifacts, request a hybrid ranking. Replace the example user and cart with a `user_id` from `cluster_labels.csv` and exact product names present in the rule artifact:
 
 ```bash
-# Customer clustering
-python mining/customer_clustering.py
-
-# Market basket analysis
-python mining/market_basket.py
-
-# Recommendations demo
-python mining/recommendation.py
+instacart-recommend \
+  --user-id 1 \
+  --cart "Banana" "Bag of Organic Bananas" \
+  --top-n 10
 ```
 
----
+Use `--help` on any command for the complete option list.
 
-## File Structure
+## Customer clustering
 
-```
-mining/
-├── __init__.py
-├── customer_clustering.py      # K-Means implementation
-├── market_basket.py            # Apriori/FP-Growth
-├── recommendation.py           # Hybrid recommender
-└── results/                    # Output directory
-    ├── elbow_curve.png         # K selection chart
-    ├── clusters_pca.png        # 2D cluster visualization
-    ├── clusters_3d.png         # 3D cluster visualization
-    ├── cluster_profiles.csv    # Cluster statistics
-    ├── cluster_profiles_chart.png
-    ├── cluster_labels.csv      # User assignments (206K rows)
-    ├── association_rules.csv   # MBA rules (500-2000 rules)
-    ├── association_rules_viz.png
-    └── frequent_itemsets.csv   # Frequent patterns
-```
+`instacart-cluster` aggregates one row per user with at least `--min-orders` orders. The model standardizes these four features before fitting K-Means:
 
----
+- `total_orders`
+- `avg_basket_size`
+- `avg_reorder_ratio`
+- `avg_days_between_orders`
 
-## Example Outputs
+By default, candidate K values run from 2 through `min(--max-k, number_of_users - 1)`. The command chooses the candidate with the highest silhouette score unless `--clusters` supplies an explicit K. Both candidate selection and final fitting use the configured seed and K-Means uses `n_init=10` and `max_iter=300`.
 
-### Cluster Profiles
+Silhouette scoring is bounded by `--silhouette-sample-size` (default 10,000) and deterministically includes every cluster in the scoring sample. Model fitting still uses every eligible user. When plots are enabled, the PCA scatter renders at most 20,000 deterministic points; clustering labels are not sampled.
 
-| Cluster | Name | Users | Avg Orders | Avg Basket | Reorder Rate |
-|---------|------|-------|------------|------------|--------------|
-| 0 | VIP Customers | 15,234 | 78.3 | 12.4 | 68.2% |
-| 1 | Frequent Shoppers | 48,921 | 28.7 | 10.8 | 52.1% |
-| 2 | Regular Customers | 89,456 | 14.2 | 9.1 | 38.7% |
-| 3 | Occasional Buyers | 52,598 | 5.6 | 7.3 | 22.4% |
+Useful controls:
 
-### Association Rules (Top 5)
-
-```
-1. Organic Avocado → Banana
-   Support: 0.0521 | Confidence: 68.3% | Lift: 2.34
-
-2. Strawberries, Banana → Organic Spinach
-   Support: 0.0218 | Confidence: 71.9% | Lift: 3.12
-
-3. Organic Whole Milk → Organic Half & Half
-   Support: 0.0389 | Confidence: 54.7% | Lift: 1.87
-
-4. Limes → Organic Avocado, Banana
-   Support: 0.0156 | Confidence: 62.1% | Lift: 2.89
-
-5. Organic Raspberries → Organic Blueberries
-   Support: 0.0294 | Confidence: 76.4% | Lift: 3.45
+```bash
+instacart-cluster \
+  --min-orders 5 \
+  --max-k 8 \
+  --clusters 4 \
+  --silhouette-sample-size 5000 \
+  --seed 42 \
+  --output-dir artifacts/clustering-run
 ```
 
-### Recommendation Example
+Omit `--clusters` to restore silhouette-based K selection. Add `--no-plots` to skip both PNG files.
 
-```python
-# Cart-based recommendation
-cart = ['Banana', 'Organic Avocado', 'Strawberries']
+### Clustering artifacts
 
-recommendations = recommend_by_rules(cart, rules, n=5)
-# Output:
-# 1. Organic Spinach (Lift: 3.12)
-# 2. Organic Blueberries (Lift: 2.87)
-# 3. Organic Whole Milk (Lift: 2.34)
-# 4. Limes (Lift: 2.09)
-# 5. Organic Raspberries (Lift: 1.95)
+All JSON metadata currently uses `artifact_schema_version: 1`.
+
+| File | Schema or contents |
+| --- | --- |
+| `cluster_profiles.csv` | `cluster`, `cluster_name`, `num_users`, `total_orders_mean`, `total_orders_median`, `avg_basket_size_mean`, `avg_reorder_ratio_mean`, `avg_days_between_orders_mean` |
+| `cluster_labels.csv` | `user_id`, `cluster`, sorted by `user_id` |
+| `kmeans_model.joblib` | Fitted scikit-learn `KMeans` object, including recorded training metrics |
+| `standard_scaler.joblib` | Fitted `StandardScaler` for the four ordered feature columns |
+| `clustering_metadata.json` | Feature order, minimum-order filter, row count, seed, silhouette bound, selected K and source, per-candidate inertia/silhouette values, final training metrics, optional PCA metrics, embedded cluster profiles, and artifact filenames |
+| `cluster_selection.png` | Optional candidate-K inertia and silhouette chart |
+| `clusters_pca.png` | Optional two-dimensional PCA projection coloured by cluster |
+
+Final training metrics in the metadata are `silhouette`, `davies_bouldin`, and `inertia`. They describe the fitted sample; this repository does not publish fixed expected values.
+
+### Two different segment concepts
+
+The warehouse and mining module deliberately expose different contracts:
+
+| Contract | Source | Meaning | Current consumer |
+| --- | --- | --- | --- |
+| Rule-based segment | `Dim_User.user_segment` | `VIP` for 50+ orders, `Frequent` for 20–49, `Regular` for 10–19, and `New` for fewer than 10 | Dashboard customer page |
+| K-Means cluster | `cluster_labels.csv` | Data-driven assignment using the four standardized features above | Hybrid recommender and offline analysis |
+
+`cluster_name` is a post-hoc description derived from each cluster's mean order count (`VIP Customers`, `Frequent Shoppers`, `Regular Customers`, or `Occasional Buyers`). It does not turn the K-Means assignment into the ETL rule and multiple clusters may receive the same description.
+
+## Market-basket mining
+
+`instacart-basket` selects complete orders deterministically by sorting a seeded CRC32 value of `order_id`. `--order-limit` therefore limits orders before joining their line items; it never truncates a basket. If no mode flag is supplied, `MINING_ORDER_LIMIT` supplies the bound (100,000 in `.env.example`).
+
+The command then:
+
+1. removes baskets below `--min-items` (default 2);
+2. keeps the `--top-products` most frequent product identifiers (default 2,000);
+3. builds a pandas sparse transaction matrix while retaining one row per selected basket, including rows emptied by product pruning;
+4. runs FP-Growth by default, or Apriori with `--algorithm apriori`;
+5. filters rules by `--min-confidence` and writes exact ID/name itemsets as JSON arrays inside CSV cells.
+
+Keeping emptied rows preserves the selected-transaction denominator used by support. JSON arrays avoid ambiguous comma-delimited parsing when a product name itself contains a comma.
+
+Sample and full modes are mutually exclusive:
+
+```bash
+# Reproducible bounded experiment
+instacart-basket --order-limit 25000 --seed 42 --no-plot
+
+# Explicitly process every warehouse order
+instacart-basket --full
 ```
 
----
+`--full` is intentionally opt-in. Its runtime and memory demand depend on the loaded data, thresholds, and product bound.
 
-## Performance
+### Market-basket artifacts
 
-### Clustering
-- **Dataset:** 150K-200K active users (≥3 orders)
-- **Runtime:** ~30 seconds
-- **Memory:** ~500 MB
+| File | Schema or contents |
+| --- | --- |
+| `frequent_itemsets.csv` | `itemsets_json`, `support`, `length`, `item_names_json` |
+| `association_rules.csv` | `antecedents_json`, `consequents_json`, `support`, `confidence`, `lift`, `leverage`, `conviction`, `antecedent_names_json`, `consequent_names_json` |
+| `market_basket_metadata.json` | Schema version, creation time, sample/full mode, requested order limit, seed, minimum basket size, retained transaction count, product bound, matrix shape, algorithm, thresholds, result counts, elapsed seconds, and artifact filenames |
+| `association_rules.png` | Optional support-versus-confidence scatter plot coloured by lift |
 
-### Market Basket Analysis
-- **Dataset:** 50K-100K orders (configurable via `limit` parameter)
-- **Runtime:** 2-5 minutes (FP-Growth), 10-30 minutes (Apriori)
-- **Memory:** ~2 GB
+The CLI supplies the product catalog, so its CSV artifacts contain both identifier and name JSON columns. The lower-level save helpers can omit name columns when no catalog is passed.
 
-**Note:** For full dataset (3.4M orders), increase limit or remove it. Expect 30-60 minutes runtime.
+## Hybrid recommendation
 
----
+`instacart-recommend` reads `association_rules.csv` and `cluster_labels.csv` from `mining/results/` unless `--rules` or `--clusters` points elsewhere. It also needs the live warehouse to rank products purchased by users in the target user's cluster.
 
-## Evaluation Metrics
+The rule ranking applies a rule only when its complete antecedent is an exact subset of the cart. The CLI matches exact product names; it does not use substring matching. The cluster ranking uses a connection-local temporary table, joins cluster members through orders and order details, ranks product popularity, and drops the temporary table before returning.
 
-### Clustering Quality
+The two independent rankings are combined with weighted reciprocal-rank fusion:
 
-```python
-# Silhouette Score: 0.45 (range: -1 to 1, higher is better)
-# Davies-Bouldin Index: 0.78 (lower is better)
-# Inertia: 124,567 (lower is better)
+- rule weight: `0.6` by default;
+- cluster weight: `0.4` by default;
+- RRF constant: `60` by default.
+
+These weights affect rank fusion; they are not probabilities. Cart items are excluded from the output. The command prints the final ranking and score but does not write a recommendation artifact.
+
+Use artifacts from a custom run like this:
+
+```bash
+instacart-recommend \
+  --user-id 1 \
+  --cart "Banana" \
+  --rules artifacts/basket-run/association_rules.csv \
+  --clusters artifacts/clustering-run/cluster_labels.csv \
+  --rule-weight 0.6 \
+  --cluster-weight 0.4 \
+  --rrf-k 60
 ```
 
-### Rule Quality
+## Verification
 
-```python
-# Total rules: 1,234
-# Average lift: 2.34
-# High confidence rules (≥50%): 678 (54.9%)
-# Product coverage: 2,456 products
+The mining tests are deterministic and do not require a live warehouse:
+
+```bash
+MPLBACKEND=Agg .venv/bin/python -m pytest \
+  tests/test_mining_artifacts.py \
+  tests/test_mining_clustering.py \
+  tests/test_mining_market_basket.py \
+  tests/test_mining_recommendation.py \
+  -W error::FutureWarning
+
+.venv/bin/python -m ruff check mining tests/test_mining_*.py
 ```
 
----
+## Known limitations
 
-## Business Applications
-
-### 1. Marketing Campaigns
-
-**VIP Customers:**
-- Exclusive early access to new products
-- Free shipping threshold lowered
-- Birthday discounts
-
-**Churned Users:**
-- "We miss you" emails with 20% off
-- Personalized product recommendations
-- Limited-time offers
-
-### 2. Product Recommendations
-
-**Homepage:**
-```
-"Popular with customers like you"
-[Show top 5 products from user's cluster]
-```
-
-**Cart Page:**
-```
-"Frequently bought together"
-[Show association rules for cart items]
-```
-
-**Checkout:**
-```
-"Complete your order"
-[Hybrid recommendations]
-```
-
-### 3. Inventory Management
-
-**Bundling Strategy:**
-- Create bundles from high-lift rules
-- Example: "Breakfast Bundle" (Banana + Milk + Cereal)
-
-**Store Layout:**
-- Place associated products near each other
-- Example: Avocado near Limes (Lift: 2.89)
-
----
-
-## Troubleshooting
-
-### Issue: "No rules found"
-
-**Solution:** Lower thresholds
-```python
-# In market_basket.py, line 97
-frequent_itemsets = run_fpgrowth(df_basket, min_support=0.005)  # Lower from 0.01
-
-# Line 107
-rules = generate_rules(frequent_itemsets, min_threshold=0.2)  # Lower from 0.3
-```
-
-### Issue: Memory error
-
-**Solution:** Limit transaction size
-```python
-# In market_basket.py, line 265
-transactions = extract_transactions(limit=10000, min_items=2)  # Start small
-```
-
-### Issue: Slow clustering
-
-**Solution:** Sample users
-```python
-# In customer_clustering.py, line 31
-df = df.sample(n=50000, random_state=42)  # Sample 50K users
-```
-
----
-
-## Next Steps
-
-### Enhancements
-
-1. **Deep Learning Recommendations**
-   - Neural Collaborative Filtering
-   - Sequence models (RNN/Transformer)
-
-2. **Real-time API**
-   - Flask/FastAPI endpoint
-   - Redis cache for rules
-   - Streaming recommendations
-
-3. **A/B Testing**
-   - Track recommendation CTR
-   - Compare rule-based vs cluster-based
-   - Optimize hybrid weights
-
-4. **Advanced Clustering**
-   - DBSCAN for outlier detection
-   - Hierarchical clustering
-   - Time-series clustering (shopping patterns over time)
-
----
-
-## References
-
-- **K-Means:** MacQueen, J. (1967)
-- **Apriori:** Agrawal & Srikant (1994)
-- **FP-Growth:** Han et al. (2000)
-- **scikit-learn docs:** https://scikit-learn.org/
-- **mlxtend docs:** http://rasbt.github.io/mlxtend/
-
----
-
-## Credits
-
-Built for "Kho dữ liệu" course project using:
-- Python 3.13
-- scikit-learn, mlxtend, pandas
-- Instacart Market Basket Analysis dataset
+- Reproducibility assumes the same warehouse contents, package versions, seed, and CLI parameters. Cluster numeric IDs have no stable business meaning across changed runs.
+- K-Means model fitting uses all eligible users. Only silhouette evaluation and rendered PCA points are bounded.
+- Market-basket sampling and top-product pruning trade coverage for bounded local execution. Results describe the selected transaction population, not every possible product relationship.
+- FP-Growth and Apriori currently have no maximum itemset length. Lower support thresholds or full mode can still create combinatorial memory and runtime pressure.
+- Association rules describe co-occurrence, not causality. Their support and confidence are not recommendation accuracy metrics.
+- `evaluate_recommendations` reports descriptive rule statistics only; there is no temporal holdout, precision/recall evaluation, online experiment, or serving API.
+- Users missing from `cluster_labels.csv` have no cluster-popularity ranking. Carts with no exact matching antecedent have no rule ranking, so the final result can be partial or empty.
+- Only load `.joblib` artifacts produced by a trusted run; joblib files are not a safe interchange format for untrusted input.

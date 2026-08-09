@@ -1,200 +1,185 @@
-import streamlit as st
+"""Lazy, safe warehouse catalogue explorer."""
+
+from __future__ import annotations
+
 import pandas as pd
-from sqlalchemy import text, inspect
+import streamlit as st
 
-@st.cache_data(ttl=300)
-def get_table_schema(_engine, table_name):
-    """Get column information for a table"""
-    inspector = inspect(_engine)
-    columns = inspector.get_columns(table_name)
-    return pd.DataFrame([
-        {
-            'Column': col['name'],
-            'Type': str(col['type']),
-            'Nullable': 'Yes' if col['nullable'] else 'No',
-            'Default': str(col['default']) if col['default'] is not None else '',
-            'Comment': col.get('comment', '')
-        }
-        for col in columns
-    ])
+from dashboard.components import (
+    format_decimal,
+    format_integer,
+    load_repository_data,
+    page_header,
+    require_columns,
+)
+from dashboard.data import AnalyticsRepository, TableMetadata
 
-@st.cache_data(ttl=300)
-def get_table_indexes(_engine, table_name):
-    """Get index information for a table"""
-    inspector = inspect(_engine)
-    indexes = inspector.get_indexes(table_name)
-    if not indexes:
-        return pd.DataFrame()
-    
-    return pd.DataFrame([
-        {
-            'Index Name': idx['name'],
-            'Columns': ', '.join(idx['column_names']),
-            'Unique': 'Yes' if idx['unique'] else 'No'
-        }
-        for idx in indexes
-    ])
 
-@st.cache_data(ttl=300)
-def get_table_row_count(_engine, table_name):
-    """Get row count for a table"""
-    try:
-        result = pd.read_sql(f"SELECT COUNT(*) as cnt FROM {table_name}", _engine)
-        return result.iloc[0, 0]
-    except Exception as e:
-        return None
+def _catalog_label(catalog: pd.DataFrame, table_name: str) -> str:
+    row = catalog[catalog["table_name"] == table_name].iloc[0]
+    return f"{table_name} · {row['kind']}"
 
-@st.cache_data(ttl=300)
-def get_table_sample(_engine, table_name, limit=10):
-    """Get sample data from a table"""
-    try:
-        return pd.read_sql(f"SELECT * FROM {table_name} LIMIT {limit}", _engine)
-    except Exception as e:
-        return pd.DataFrame()
 
-@st.cache_data(ttl=300)
-def get_table_partitions(_engine, table_name):
-    """Get partition information for a table"""
-    try:
-        query = f"""
-        SELECT 
-            PARTITION_NAME as 'Partition',
-            TABLE_ROWS as 'Rows',
-            DATA_LENGTH / 1024 / 1024 as 'Size (MB)',
-            PARTITION_COMMENT as 'Comment'
-        FROM information_schema.PARTITIONS
-        WHERE TABLE_SCHEMA = DATABASE()
-            AND TABLE_NAME = '{table_name}'
-            AND PARTITION_NAME IS NOT NULL
-        ORDER BY PARTITION_ORDINAL_POSITION
-        """
-        result = pd.read_sql(query, _engine)
-        return result if not result.empty else None
-    except Exception as e:
-        return None
+def _render_metadata(metadata: TableMetadata) -> None:
+    st.subheader(metadata.name)
+    st.caption(f"{metadata.kind} · {metadata.description}")
 
-def show_table_details(engine, table_name, table_type):
-    """Display detailed information about a table"""
-    st.subheader(f"📋 {table_name}")
-    st.caption(f"Type: {table_type}")
-    
-    # Get row count
-    row_count = get_table_row_count(engine, table_name)
-    if row_count is not None:
-        st.metric("Total Rows", f"{row_count:,}")
-    
-    # Tabs for different views
-    tab1, tab2, tab3, tab4 = st.tabs(["📊 Schema", "📝 Sample Data", "🔍 Indexes", "🗂️ Partitions"])
-    
-    with tab1:
-        st.markdown("**Table Schema**")
-        try:
-            schema_df = get_table_schema(engine, table_name)
-            if not schema_df.empty:
-                st.dataframe(schema_df, use_container_width=True, hide_index=True)
+    metric_left, metric_middle, metric_right = st.columns(3)
+    with metric_left:
+        st.metric(
+            "Estimated rows",
+            format_integer(metadata.row_count_estimate),
+            help="Warehouse statistics estimate; it may differ from an exact count.",
+        )
+    with metric_middle:
+        size_label = (
+            f"{format_decimal(metadata.size_mb, 2)} MB"
+            if metadata.size_mb is not None
+            else "Not reported"
+        )
+        st.metric("Estimated storage", size_label)
+    with metric_right:
+        st.metric("Columns", format_integer(len(metadata.columns)))
+
+    st.markdown("### Schema")
+    if metadata.columns.empty:
+        st.info("No column metadata is available for this table.")
+    else:
+        st.dataframe(
+            metadata.columns,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "column_name": "Column",
+                "data_type": "Data type",
+                "nullable": st.column_config.CheckboxColumn("Nullable"),
+                "default": "Default",
+                "comment": "Comment",
+            },
+        )
+
+    details_left, details_right = st.columns(2)
+    with details_left:
+        st.markdown("### Indexes")
+        if metadata.indexes.empty:
+            st.info("No secondary indexes are reported for this table.")
+        else:
+            st.dataframe(
+                metadata.indexes,
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "index_name": "Index",
+                    "columns": "Columns",
+                    "unique": st.column_config.CheckboxColumn("Unique"),
+                },
+            )
+    with details_right:
+        st.markdown("### Partitions")
+        if metadata.partitions.empty:
+            st.info("This table has no reported partitions.")
+        else:
+            st.dataframe(
+                metadata.partitions,
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "partition_name": "Partition",
+                    "row_count_estimate": st.column_config.NumberColumn(
+                        "Estimated rows",
+                        format="%d",
+                    ),
+                    "size_mb": st.column_config.NumberColumn(
+                        "Size (MB)",
+                        format="%.2f",
+                    ),
+                    "comment": "Comment",
+                },
+            )
+
+
+def show(repository: AnalyticsRepository) -> None:
+    page_header(
+        "Warehouse explorer",
+        (
+            "Inspect one whitelisted warehouse table at a time. Metadata is loaded "
+            "after selection, and row samples run only when explicitly requested."
+        ),
+        eyebrow="Data architecture",
+    )
+
+    catalog = load_repository_data(
+        repository,
+        "table_catalog",
+        loading_label="Loading warehouse catalogue…",
+    )
+    if not require_columns(
+        catalog,
+        ("table_name", "kind", "description", "row_count_estimate"),
+        context="Warehouse catalogue",
+    ):
+        return
+
+    st.subheader("Choose a table")
+    selected_table = st.selectbox(
+        "Warehouse table",
+        catalog["table_name"].astype(str).tolist(),
+        format_func=lambda name: _catalog_label(catalog, name),
+        help="Only repository-whitelisted dimension and fact tables are available.",
+    )
+    metadata = load_repository_data(
+        repository,
+        "table_metadata",
+        loading_label=f"Inspecting {selected_table} metadata…",
+        table_name=selected_table,
+    )
+    if metadata is None:
+        return
+    _render_metadata(metadata)
+
+    st.markdown("### Row sample")
+    sample_rows = st.slider(
+        "Rows to load",
+        min_value=5,
+        max_value=25,
+        value=10,
+        step=5,
+        help="This limit is applied by the repository before data reaches the UI.",
+    )
+    load_sample = st.checkbox(
+        f"Load a {sample_rows}-row sample from {selected_table}",
+        value=False,
+        key=f"table-sample-request-{selected_table}",
+    )
+    if load_sample:
+        sample = load_repository_data(
+            repository,
+            "table_sample",
+            loading_label=f"Loading a small sample from {selected_table}…",
+            table_name=selected_table,
+            limit=sample_rows,
+        )
+        if sample is not None:
+            if sample.empty:
+                st.info("This table returned no sample rows.")
             else:
-                st.info("No schema information available")
-        except Exception as e:
-            st.error(f"Error loading schema: {str(e)}")
-    
-    with tab2:
-        st.markdown("**Sample Data (First 10 rows)**")
-        try:
-            sample_df = get_table_sample(engine, table_name, limit=10)
-            if not sample_df.empty:
-                st.dataframe(sample_df, use_container_width=True, hide_index=True)
-            else:
-                st.info("No data available in this table")
-        except Exception as e:
-            st.error(f"Error loading sample data: {str(e)}")
-    
-    with tab3:
-        st.markdown("**Indexes**")
-        try:
-            indexes_df = get_table_indexes(engine, table_name)
-            if not indexes_df.empty:
-                st.dataframe(indexes_df, use_container_width=True, hide_index=True)
-            else:
-                st.info("No indexes defined for this table")
-        except Exception as e:
-            st.error(f"Error loading indexes: {str(e)}")
-    
-    with tab4:
-        st.markdown("**Partitions**")
-        try:
-            partitions_df = get_table_partitions(engine, table_name)
-            if partitions_df is not None and not partitions_df.empty:
-                st.dataframe(partitions_df, use_container_width=True, hide_index=True)
-                
-                # Show partition summary
-                total_rows = partitions_df['Rows'].sum()
-                total_size = partitions_df['Size (MB)'].sum()
-                st.metric("Total Partitioned Rows", f"{int(total_rows):,}")
-                st.metric("Total Size", f"{total_size:.2f} MB")
-            else:
-                st.info("This table is not partitioned")
-        except Exception as e:
-            st.error(f"Error loading partitions: {str(e)}")
+                st.dataframe(sample, width="stretch", hide_index=True)
+    else:
+        st.caption("Sample query is paused until the checkbox is selected.")
 
-def show(engine):
-    st.header("🗄️ Database Schema & Tables")
-    st.markdown("View detailed information about all dimension and fact tables in the data warehouse")
-    
-    # Table categories
-    dim_tables = {
-        "Dim_Time": "Time dimension for order analysis",
-        "Dim_Department": "Department dimension",
-        "Dim_Aisle": "Aisle dimension",
-        "Dim_Product": "Product dimension",
-        "Dim_User": "User/Customer dimension"
-    }
-    
-    fact_tables = {
-        "Fact_Orders": "Order summary fact table",
-        "Fact_Order_Details": "Order line items fact table"
-    }
-    
-    # Sidebar for quick navigation
-    st.sidebar.markdown("### Quick Navigation")
-    
-    # Dimension tables section
-    st.markdown("## 📐 Dimension Tables")
-    st.markdown("Dimension tables store descriptive attributes for analysis")
-    
-    for i, (table_name, description) in enumerate(dim_tables.items()):
-        with st.expander(f"🔷 {table_name} - {description}", expanded=(i == 0)):
-            show_table_details(engine, table_name, "Dimension")
-        st.markdown("---")
-    
-    # Fact tables section
-    st.markdown("## 📊 Fact Tables")
-    st.markdown("Fact tables store measurable business events and metrics")
-    
-    for i, (table_name, description) in enumerate(fact_tables.items()):
-        with st.expander(f"🔶 {table_name} - {description}", expanded=(i == 0)):
-            show_table_details(engine, table_name, "Fact")
-        st.markdown("---")
-    
-    # Summary section
-    st.markdown("## 📈 Database Summary")
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.markdown("### Dimension Tables")
-        dim_summary = []
-        for table_name in dim_tables.keys():
-            count = get_table_row_count(engine, table_name)
-            if count is not None:
-                dim_summary.append({"Table": table_name, "Rows": f"{count:,}"})
-        if dim_summary:
-            st.dataframe(pd.DataFrame(dim_summary), use_container_width=True, hide_index=True)
-    
-    with col2:
-        st.markdown("### Fact Tables")
-        fact_summary = []
-        for table_name in fact_tables.keys():
-            count = get_table_row_count(engine, table_name)
-            if count is not None:
-                fact_summary.append({"Table": table_name, "Rows": f"{count:,}"})
-        if fact_summary:
-            st.dataframe(pd.DataFrame(fact_summary), use_container_width=True, hide_index=True)
+    with st.expander("Full warehouse catalogue"):
+        st.caption("Row counts in this catalogue are estimates when the source reports them.")
+        st.dataframe(
+            catalog,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "table_name": "Table",
+                "kind": "Kind",
+                "description": "Purpose",
+                "row_count_estimate": st.column_config.NumberColumn(
+                    "Estimated rows",
+                    format="%d",
+                ),
+            },
+        )

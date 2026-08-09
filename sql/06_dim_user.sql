@@ -1,7 +1,7 @@
 
 USE instacart_dwh;
 
-CREATE TABLE Dim_User (
+CREATE TABLE IF NOT EXISTS Dim_User (
     user_id INT PRIMARY KEY COMMENT 'Business key from source',
     user_segment VARCHAR(20) NOT NULL DEFAULT 'New' 
         COMMENT 'Customer segment: New, Regular, VIP',
@@ -20,7 +20,10 @@ CREATE TABLE Dim_User (
     
     INDEX idx_segment (user_segment),
     INDEX idx_total_orders (total_orders),
-    INDEX idx_basket_size (avg_basket_size)
+    INDEX idx_basket_size (avg_basket_size),
+    CONSTRAINT chk_user_first_dow CHECK (first_order_dow IS NULL OR first_order_dow BETWEEN 0 AND 6),
+    CONSTRAINT chk_user_orders CHECK (total_orders >= 0),
+    CONSTRAINT chk_user_products CHECK (total_products_purchased >= 0)
 ) ENGINE=InnoDB COMMENT='User dimension (~206K users)';
 
 SELECT 'Dim_User created!' as Status;

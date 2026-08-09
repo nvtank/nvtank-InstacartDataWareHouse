@@ -1,228 +1,252 @@
-import streamlit as st
+"""Department performance and fair, normalized comparisons."""
+
+from __future__ import annotations
+
 import pandas as pd
 import plotly.express as px
-import plotly.graph_objects as go
+import streamlit as st
 
-# Cached data loading functions
-@st.cache_data(ttl=86400, show_spinner="🏪 Loading department data...")
-def get_department_overview(_engine):
-    """Get department performance overview (cached for 30 minutes)"""
-    return pd.read_sql("""
-        SELECT 
-            d.department_name,
-            COUNT(DISTINCT fod.order_id) as orders,
-            COUNT(*) as total_items,
-            ROUND(AVG(fod.reordered) * 100, 1) as reorder_rate,
-            COUNT(DISTINCT fod.product_id) as unique_products
-        FROM Fact_Order_Details fod
-        JOIN Dim_Product p ON fod.product_id = p.product_id
-        JOIN Dim_Department d ON p.department_id = d.department_id
-        GROUP BY d.department_id, d.department_name
-        ORDER BY total_items DESC
-    """, _engine)
+from dashboard.components import (
+    download_frame,
+    format_integer,
+    format_percent,
+    insight_card,
+    load_repository_data,
+    page_header,
+    plotly_chart,
+    require_columns,
+)
+from dashboard.data import AnalyticsRepository
+from dashboard.styles import CATEGORICAL_PALETTE, SEQUENTIAL_SCALE, style_figure
 
-@st.cache_data(ttl=86400, show_spinner="🔁 Loading reorder data...")
-def get_department_reorder_rates(_engine):
-    """Get reorder rates by department (cached for 30 minutes)"""
-    return pd.read_sql("""
-        SELECT 
-            d.department_name,
-            ROUND(AVG(fod.reordered) * 100, 1) as reorder_rate,
-            COUNT(*) as items
-        FROM Fact_Order_Details fod
-        JOIN Dim_Product p ON fod.product_id = p.product_id
-        JOIN Dim_Department d ON p.department_id = d.department_id
-        GROUP BY d.department_id, d.department_name
-        ORDER BY reorder_rate DESC
-    """, _engine)
+COMPARISON_METRICS = {
+    "orders": "Order reach",
+    "total_items": "Item volume",
+    "unique_products": "Product breadth",
+    "reorder_rate_pct": "Reorder rate",
+}
 
-@st.cache_data(ttl=86400)
-def get_department_list(_engine):
-    """Get list of all departments (cached for 30 minutes)"""
-    return pd.read_sql(
-        "SELECT DISTINCT department_name FROM Dim_Department ORDER BY department_name",
-        _engine
-    )['department_name'].tolist()
 
-@st.cache_data(ttl=86400)
-def get_department_comparison(_engine, dept1, dept2):
-    """Compare two departments (cached for 30 minutes)"""
-    return pd.read_sql(f"""
-        SELECT 
-            d.department_name,
-            COUNT(DISTINCT fod.order_id) as orders,
-            COUNT(*) as items,
-            ROUND(AVG(fod.reordered) * 100, 1) as reorder_rate,
-            COUNT(DISTINCT fod.product_id) as products
-        FROM Fact_Order_Details fod
-        JOIN Dim_Product p ON fod.product_id = p.product_id
-        JOIN Dim_Department d ON p.department_id = d.department_id
-        WHERE d.department_name IN ('{dept1}', '{dept2}')
-        GROUP BY d.department_name
-    """, _engine)
+def _normalized_comparison(
+    departments: pd.DataFrame,
+    selected_names: tuple[str, str],
+) -> pd.DataFrame:
+    """Express unlike department metrics on a comparable 0-100 index."""
 
-def show(engine):
-    st.header("🏪 Department Performance")
-    st.markdown("Analyze department-level metrics and trends")
-    
-    # Department Overview
-    st.subheader("📊 Department Performance Overview")
-    
-    try:
-        # Use cached function
-        df_dept = get_department_overview(engine)
-        
-        if not df_dept.empty:
-            # Calculate market share
-            df_dept['market_share'] = (df_dept['total_items'] / df_dept['total_items'].sum() * 100).round(2)
-            
-            # Top departments bar chart
-            fig = px.bar(
-                df_dept.head(10),
-                x='department_name',
-                y='total_items',
-                color='reorder_rate',
-                color_continuous_scale='RdYlGn',
-                labels={
-                    'department_name': 'Department',
-                    'total_items': 'Total Items Sold',
-                    'reorder_rate': 'Reorder Rate (%)'
-                },
-                title='Top 10 Departments by Sales Volume'
+    selected = departments[departments["department_name"].isin(selected_names)].copy()
+    rows: list[dict[str, object]] = []
+    for column, label in COMPARISON_METRICS.items():
+        metric_ceiling = pd.to_numeric(departments[column], errors="coerce").max()
+        for _, department in selected.iterrows():
+            actual = pd.to_numeric(pd.Series([department[column]]), errors="coerce").iloc[0]
+            score = 0.0
+            if pd.notna(actual) and pd.notna(metric_ceiling) and metric_ceiling > 0:
+                score = float(actual) / float(metric_ceiling) * 100
+            rows.append(
+                {
+                    "department_name": department["department_name"],
+                    "metric": label,
+                    "relative_index": score,
+                }
             )
-            fig.update_xaxes(tickangle=-45)
-            st.plotly_chart(fig, use_container_width=True)
-            
-            # Department details table
-            st.markdown("**📋 Department Details:**")
-            st.dataframe(
-                df_dept.style.format({
-                    'orders': '{:,}',
-                    'total_items': '{:,}',
-                    'reorder_rate': '{:.1f}%',
-                    'unique_products': '{:,}',
-                    'market_share': '{:.2f}%'
-                }),
-                use_container_width=True,
-                height=400
+    return pd.DataFrame(rows)
+
+
+def show(repository: AnalyticsRepository) -> None:
+    page_header(
+        "Department performance",
+        (
+            "Compare reach, item volume, assortment breadth, and repeat behavior "
+            "without mixing incompatible units on one scale."
+        ),
+        eyebrow="Portfolio allocation",
+    )
+
+    departments = load_repository_data(
+        repository,
+        "departments",
+        loading_label="Loading department aggregates…",
+    )
+    required = (
+        "department_name",
+        "orders",
+        "total_items",
+        "reorder_rate_pct",
+        "unique_products",
+        "market_share_pct",
+    )
+    if not require_columns(departments, required, context="Department performance"):
+        return
+
+    department_frame = departments.copy()
+    department_frame["department_name"] = department_frame["department_name"].astype(str)
+
+    st.subheader("Portfolio view")
+    chart_frame = department_frame.nlargest(12, "total_items").sort_values("total_items")
+    portfolio_chart = px.bar(
+        chart_frame,
+        x="total_items",
+        y="department_name",
+        orientation="h",
+        color="reorder_rate_pct",
+        color_continuous_scale=SEQUENTIAL_SCALE,
+        title="Largest departments by line-item volume",
+        labels={
+            "total_items": "Line items",
+            "department_name": "Department",
+            "reorder_rate_pct": "Reorder rate (%)",
+        },
+        hover_data={"orders": ":,.0f", "market_share_pct": ":.1f"},
+    )
+    portfolio_chart.update_traces(
+        hovertemplate=(
+            "%{y}<br>%{x:,.0f} line items<br>Reorder rate: %{marker.color:.1f}%<extra></extra>"
+        )
+    )
+    plotly_chart(
+        style_figure(
+            portfolio_chart,
+            height=max(460, 34 * len(chart_frame) + 170),
+        ),
+        key="departments-portfolio",
+    )
+
+    insight_left, insight_right = st.columns(2)
+    volume_leader = department_frame.loc[department_frame["total_items"].idxmax()]
+    reorder_leader = department_frame.loc[department_frame["reorder_rate_pct"].idxmax()]
+    with insight_left:
+        insight_card(
+            "Volume leader",
+            (
+                f"{volume_leader['department_name']} represents "
+                f"{format_percent(volume_leader['market_share_pct'])} of line items "
+                f"in this snapshot."
+            ),
+        )
+    with insight_right:
+        insight_card(
+            "Repeat leader",
+            (
+                f"{reorder_leader['department_name']} has the highest department "
+                f"reorder rate at {format_percent(reorder_leader['reorder_rate_pct'])}."
+            ),
+        )
+
+    st.subheader("Side-by-side comparison")
+    department_names = sorted(department_frame["department_name"].unique())
+    if len(department_names) < 2:
+        st.info("At least two departments are required for a comparison.")
+    else:
+        selector_left, selector_right = st.columns(2)
+        with selector_left:
+            first_name = st.selectbox(
+                "First department",
+                department_names,
+                index=0,
+                key="department-compare-first",
             )
-            
-            # Top performer highlight
-            top_dept = df_dept.iloc[0]
-            st.success(f"🏆 **Top Department:** {top_dept['department_name']} with {top_dept['market_share']:.1f}% market share")
-        else:
-            st.info("No data available. Please run ETL pipeline first.")
-    except Exception as e:
-        st.error(f"Error loading data: {str(e)}")
-    
-    # Reorder Rate by Department
-    st.markdown("---")
-    st.subheader("🔁 Reorder Rate Comparison")
-    
-    try:
-        # Use cached function
-        df_reorder = get_department_reorder_rates(engine)
-        
-        if not df_reorder.empty:
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                # Horizontal bar chart
-                fig = px.bar(
-                    df_reorder,
-                    x='reorder_rate',
-                    y='department_name',
-                    orientation='h',
-                    color='reorder_rate',
-                    color_continuous_scale='RdYlGn',
-                    labels={
-                        'reorder_rate': 'Reorder Rate (%)',
-                        'department_name': 'Department'
-                    },
-                    title='Reorder Rate by Department'
-                )
-                fig.update_layout(
-                    yaxis={'categoryorder': 'total ascending'},
-                    height=600
-                )
-                st.plotly_chart(fig, use_container_width=True)
-            
-            with col2:
-                # Scatter plot: Items vs Reorder Rate
-                fig = px.scatter(
-                    df_reorder,
-                    x='items',
-                    y='reorder_rate',
-                    size='items',
-                    color='reorder_rate',
-                    hover_name='department_name',
-                    color_continuous_scale='Viridis',
-                    labels={
-                        'items': 'Total Items Sold',
-                        'reorder_rate': 'Reorder Rate (%)'
-                    },
-                    title='Sales Volume vs Reorder Rate'
-                )
-                fig.update_layout(height=600)
-                st.plotly_chart(fig, use_container_width=True)
-            
-            # Best and worst reorder rate
-            best_reorder = df_reorder.iloc[0]
-            worst_reorder = df_reorder.iloc[-1]
-            
-            col1, col2 = st.columns(2)
-            with col1:
-                st.success(f"✅ **Highest Reorder Rate:** {best_reorder['department_name']} ({best_reorder['reorder_rate']:.1f}%)")
-            with col2:
-                st.warning(f"⚠️ **Lowest Reorder Rate:** {worst_reorder['department_name']} ({worst_reorder['reorder_rate']:.1f}%)")
-        else:
-            st.info("No data available. Please run ETL pipeline first.")
-    except Exception as e:
-        st.error(f"Error loading data: {str(e)}")
-    
-    # Department Comparison Tool
-    st.markdown("---")
-    st.subheader("🔍 Department Comparison")
-    
-    try:
-        # Get department list for dropdown (cached)
-        dept_list = get_department_list(engine)
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            dept1 = st.selectbox("Select Department 1:", dept_list, key='dept1')
-        with col2:
-            dept2 = st.selectbox("Select Department 2:", dept_list, index=min(1, len(dept_list)-1), key='dept2')
-        
-        if dept1 and dept2:
-            # Use cached comparison function
-            df_compare = get_department_comparison(engine, dept1, dept2)
-            
-            if not df_compare.empty and len(df_compare) == 2:
-                metrics = ['orders', 'items', 'reorder_rate', 'products']
-                metric_names = ['Orders', 'Items Sold', 'Reorder Rate (%)', 'Product Variety']
-                
-                fig = go.Figure()
-                
-                for dept in [dept1, dept2]:
-                    dept_data = df_compare[df_compare['department_name'] == dept]
-                    values = [dept_data[m].values[0] for m in metrics]
-                    
-                    fig.add_trace(go.Scatterpolar(
-                        r=values,
-                        theta=metric_names,
-                        fill='toself',
-                        name=dept
-                    ))
-                
-                fig.update_layout(
-                    polar=dict(radialaxis=dict(visible=True)),
-                    showlegend=True,
-                    title=f'Department Comparison: {dept1} vs {dept2}'
-                )
-                
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.warning("Unable to compare departments. Please ensure data exists for both.")
-    except Exception as e:
-        st.error(f"Error loading comparison: {str(e)}")
+        second_options = [name for name in department_names if name != first_name]
+        with selector_right:
+            second_name = st.selectbox(
+                "Second department",
+                second_options,
+                index=0,
+                key="department-compare-second",
+            )
+
+        normalized = _normalized_comparison(
+            department_frame,
+            (first_name, second_name),
+        )
+        comparison_chart = px.bar(
+            normalized,
+            x="metric",
+            y="relative_index",
+            color="department_name",
+            barmode="group",
+            color_discrete_sequence=CATEGORICAL_PALETTE,
+            title="Relative performance index by metric",
+            labels={
+                "metric": "Metric",
+                "relative_index": "Index (best department = 100)",
+                "department_name": "Department",
+            },
+        )
+        comparison_chart.update_yaxes(range=[0, 105], ticksuffix="")
+        comparison_chart.update_traces(
+            hovertemplate=("%{x}<br>Relative index: %{y:.1f}<br>%{fullData.name}<extra></extra>")
+        )
+        plotly_chart(
+            style_figure(
+                comparison_chart,
+                height=440,
+                legend=True,
+                horizontal_legend=True,
+            ),
+            key="departments-comparison",
+        )
+        st.caption(
+            "Each score is the department value divided by the highest value for "
+            "that metric across all departments in this snapshot. The table below "
+            "retains the original units."
+        )
+
+        actual = department_frame[
+            department_frame["department_name"].isin((first_name, second_name))
+        ][list(("department_name", *COMPARISON_METRICS))]
+        st.dataframe(
+            actual,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "department_name": "Department",
+                "orders": st.column_config.NumberColumn(
+                    "Distinct orders",
+                    format="%d",
+                ),
+                "total_items": st.column_config.NumberColumn(
+                    "Line items",
+                    format="%d",
+                ),
+                "unique_products": st.column_config.NumberColumn(
+                    "Unique products",
+                    format="%d",
+                ),
+                "reorder_rate_pct": st.column_config.NumberColumn(
+                    "Reorder rate",
+                    format="%.1f%%",
+                ),
+            },
+        )
+        first_row = actual[actual["department_name"] == first_name].iloc[0]
+        second_row = actual[actual["department_name"] == second_name].iloc[0]
+        item_difference = int(first_row["total_items"] - second_row["total_items"])
+        higher_name = first_name if item_difference >= 0 else second_name
+        insight_card(
+            "Comparison readout",
+            (
+                f"{higher_name} has the larger item footprint; the absolute gap is "
+                f"{format_integer(abs(item_difference))} line items. Use reorder "
+                "rate separately to judge repeat behavior."
+            ),
+        )
+
+    with st.expander("Department data and download"):
+        st.dataframe(
+            department_frame,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "orders": st.column_config.NumberColumn(format="%d"),
+                "total_items": st.column_config.NumberColumn(format="%d"),
+                "unique_products": st.column_config.NumberColumn(format="%d"),
+                "reorder_rate_pct": st.column_config.NumberColumn(format="%.1f%%"),
+                "market_share_pct": st.column_config.NumberColumn(format="%.1f%%"),
+            },
+        )
+        download_frame(
+            department_frame,
+            label="Download department aggregates",
+            file_name="instacart-departments.csv",
+            key="departments-download",
+        )

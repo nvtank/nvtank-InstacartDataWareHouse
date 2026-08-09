@@ -1,104 +1,118 @@
+"""Instacart Decision Intelligence Streamlit entry point."""
 
-# Imports
-import streamlit as st
-import pandas as pd
-import plotly.express as px
-import plotly.graph_objects as go
-from sqlalchemy import text
+from __future__ import annotations
+
 import sys
-import os
+from collections.abc import Callable
+from pathlib import Path
 
-# Add project root to Python path
-project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if project_root not in sys.path:
-    sys.path.insert(0, project_root)
+import streamlit as st
 
-from etl.config import get_engine
-# Page config - PHẢI ĐẶT TRƯỚC CÁC IMPORTS KHÁC
 st.set_page_config(
-    page_title="Instacart Analytics Dashboard",
+    page_title="Instacart Decision Intelligence",
     page_icon="🛒",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
+    menu_items={
+        "About": (
+            "Instacart Decision Intelligence explores a batch-loaded public "
+            "market-basket dataset through a reproducible analytics contract."
+        )
+    },
 )
 
-# Custom CSS
-st.markdown("""
-<style>
-    .main-header {
-        font-size: 2.5rem;
-        font-weight: bold;
-        color: #1f77b4;
-        text-align: center;
-        margin-bottom: 2rem;
-    }
-    .metric-card {
-        background-color: #f0f2f6;
-        padding: 1rem;
-        border-radius: 0.5rem;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-    }
-    .stMetric {
-        background-color: #f0f2f6;
-        padding: 15px;
-        border-radius: 10px;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-    }
-</style>
-""", unsafe_allow_html=True)
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
-# Initialize database connection với persistent caching
-@st.cache_resource(show_spinner="🔌 Connecting to database...")
-def init_connection():
-    """
-    Initialize database connection
-    - Cached indefinitely (persistent across reruns)
-    - Only recreated if server restarts
-    """
-    return get_engine()
-
-# Get cached connection
-engine = init_connection()
-
-# Sidebar navigation
-st.sidebar.title("🛒 Instacart DWH")
-st.sidebar.markdown("**Data Warehouse & Analytics**")
-st.sidebar.markdown("---")
-page = st.sidebar.radio(
-    "📑 Navigation",
-    ["📊 Overview", "🏆 Products", "⏰ Time Analysis", 
-     "👥 Customers", "🏪 Departments", "🗄️ Tables"]
+from dashboard.components import clear_data_cache, render_source_status
+from dashboard.data import (
+    AnalyticsRepository,
+    RepositoryConfigurationError,
+    RepositoryUnavailableError,
+    create_repository,
 )
+from dashboard.pages import customers, departments, overview, products, tables, time_analysis
+from dashboard.styles import inject_global_styles
+from etl.config import ConfigurationError, get_settings
 
-st.sidebar.markdown("---")
-st.sidebar.info("""
-**Dashboard Features:**
-- Real-time KPI tracking
-- Interactive visualizations
-- Customer segmentation
-- Product recommendations
-""")
+PageRenderer = Callable[[AnalyticsRepository], None]
+PAGES: dict[str, PageRenderer] = {
+    "Executive overview": overview.show,
+    "Products & aisles": products.show,
+    "Shopping rhythm": time_analysis.show,
+    "Customer segments": customers.show,
+    "Departments": departments.show,
+    "Warehouse explorer": tables.show,
+}
 
-# Main title
-st.markdown('<p class="main-header">🛒 Instacart Analytics Dashboard</p>', 
-            unsafe_allow_html=True)
 
-# Page routing
-if page == "📊 Overview":
-    from pages import overview
-    overview.show(engine)
-elif page == "🏆 Products":
-    from pages import products
-    products.show(engine)
-elif page == "⏰ Time Analysis":
-    from pages import time_analysis
-    time_analysis.show(engine)
-elif page == "👥 Customers":
-    from pages import customers
-    customers.show(engine)
-elif page == "🏪 Departments":
-    from pages import departments
-    departments.show(engine)
-elif page == "🗄️ Tables":
-    from pages import tables
-    tables.show(engine)
+@st.cache_resource(show_spinner=False)
+def initialize_repository() -> AnalyticsRepository:
+    """Create one checked repository resource for the Streamlit server process."""
+
+    return create_repository(get_settings())
+
+
+def render_sidebar(repository: AnalyticsRepository) -> str:
+    st.sidebar.title("Instacart Intelligence")
+    st.sidebar.caption("Decision cockpit · warehouse snapshot")
+    st.sidebar.divider()
+    selected_page = st.sidebar.radio(
+        "Analysis workspace",
+        tuple(PAGES),
+        index=0,
+    )
+    st.sidebar.divider()
+    metadata = repository.source_metadata
+    st.sidebar.markdown("**Data source**")
+    st.sidebar.caption(
+        "Live MariaDB warehouse" if metadata.is_live else "Representative demo snapshot"
+    )
+    st.sidebar.caption(f"Source policy: {metadata.requested_mode.upper()}")
+    if st.sidebar.button("Refresh snapshot", width="stretch"):
+        clear_data_cache()
+        initialize_repository.clear()
+        st.rerun()
+    st.sidebar.caption(
+        "Instacart's source data contains day-of-week and hour fields, not calendar dates."
+    )
+    return selected_page
+
+
+def main() -> None:
+    inject_global_styles()
+    try:
+        repository = initialize_repository()
+    except (ConfigurationError, RepositoryConfigurationError):
+        st.error(
+            "Dashboard configuration is invalid. Check DASHBOARD_MODE and the "
+            "documented environment variables, then restart the app."
+        )
+        st.stop()
+    except RepositoryUnavailableError:
+        st.error(
+            "Live mode was requested, but the warehouse did not pass its readiness "
+            "check. Use DASHBOARD_MODE=auto for safe demo fallback or repair the "
+            "database connection."
+        )
+        st.stop()
+    except Exception:
+        st.error(
+            "The analytics source could not be initialized. No credentials or raw "
+            "connection details are displayed in this interface."
+        )
+        st.stop()
+
+    selected_page = render_sidebar(repository)
+    render_source_status(repository.source_metadata)
+    PAGES[selected_page](repository)
+    st.divider()
+    st.caption(
+        "Instacart Decision Intelligence · aggregate analytics over an anonymized "
+        "public market-basket dataset."
+    )
+
+
+if __name__ == "__main__":
+    main()

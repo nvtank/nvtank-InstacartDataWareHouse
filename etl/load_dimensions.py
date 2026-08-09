@@ -1,162 +1,123 @@
-"""
-ETL Pipeline - Load Dimension Tables
-Load aisles, departments, and products
-"""
-import pandas as pd
+"""Stream validated Instacart dimensions into the warehouse."""
+
+from __future__ import annotations
+
 import sys
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from pathlib import Path
+
+import pandas as pd
 from sqlalchemy import text
-from config import get_engine, CSV_FILES, BATCH_SIZE
-import time
+from sqlalchemy.engine import Connection, Engine
 
-def load_dim_department(engine):
-    """Load Dim_Department from departments.csv"""
-    print("\n[1/3] Loading Dim_Department...")
-    start_time = time.time()
-    
-    try:
-        # Read CSV
-        df = pd.read_csv(CSV_FILES['departments'])
-        print(f"  ✓ Read {len(df)} departments from CSV")
-        
-        # Add dept_category (categorize departments)
-        def categorize_department(dept_name):
-            dept_lower = dept_name.lower()
-            if any(word in dept_lower for word in ['produce', 'frozen', 'meat', 'seafood', 'deli']):
-                return 'Food'
-            elif any(word in dept_lower for word in ['dairy', 'beverages', 'alcohol']):
-                return 'Beverage'
-            elif any(word in dept_lower for word in ['personal', 'beauty', 'health']):
-                return 'Personal Care'
-            elif any(word in dept_lower for word in ['household', 'pets']):
-                return 'Household'
-            else:
-                return 'General'
-        
-        df['dept_category'] = df['department'].apply(categorize_department)
-        
-        # Rename columns to match schema
-        df = df.rename(columns={'department': 'department_name'})
-        
-        # Load to database
-        df.to_sql('Dim_Department', engine, if_exists='append', index=False, method='multi', chunksize=BATCH_SIZE)
-        
-        elapsed = time.time() - start_time
-        print(f"  ✓ Loaded {len(df)} records in {elapsed:.2f}s")
-        return True
-        
-    except Exception as e:
-        print(f"  ✗ Error: {e}")
-        return False
+from etl.config import Settings, get_engine, get_settings
+from etl.quality import DataQualityError, require_source_files
+from etl.transforms import transform_aisles, transform_departments, transform_products
 
-def load_dim_aisle(engine):
-    """Load Dim_Aisle from aisles.csv"""
-    print("\n[2/3] Loading Dim_Aisle...")
-    start_time = time.time()
-    
-    try:
-        # Read CSV
-        df = pd.read_csv(CSV_FILES['aisles'])
-        print(f"  ✓ Read {len(df)} aisles from CSV")
-        
-        # Add aisle_type (categorize aisles)
-        def categorize_aisle(aisle_name):
-            aisle_lower = aisle_name.lower()
-            if any(word in aisle_lower for word in ['fresh', 'produce', 'fruit', 'vegetable']):
-                return 'Fresh'
-            elif any(word in aisle_lower for word in ['frozen', 'ice']):
-                return 'Frozen'
-            elif any(word in aisle_lower for word in ['beverage', 'drink', 'juice', 'soda', 'water']):
-                return 'Beverage'
-            elif any(word in aisle_lower for word in ['snack', 'candy', 'chocolate', 'cookies']):
-                return 'Snacks'
-            elif any(word in aisle_lower for word in ['dairy', 'milk', 'yogurt', 'cheese']):
-                return 'Dairy'
-            elif any(word in aisle_lower for word in ['packaged', 'canned', 'dry']):
-                return 'Dry Goods'
-            else:
-                return 'General'
-        
-        df['aisle_type'] = df['aisle'].apply(categorize_aisle)
-        
-        # Rename columns
-        df = df.rename(columns={'aisle': 'aisle_name'})
-        
-        # Load to database
-        df.to_sql('Dim_Aisle', engine, if_exists='append', index=False, method='multi', chunksize=BATCH_SIZE)
-        
-        elapsed = time.time() - start_time
-        print(f"  ✓ Loaded {len(df)} records in {elapsed:.2f}s")
-        return True
-        
-    except Exception as e:
-        print(f"  ✗ Error: {e}")
-        return False
+DatabaseBind = Engine | Connection
+FrameTransform = Callable[[pd.DataFrame], pd.DataFrame]
 
-def load_dim_product(engine):
-    """Load Dim_Product from products.csv"""
-    print("\n[3/3] Loading Dim_Product...")
-    start_time = time.time()
-    
-    try:
-        # Read CSV
-        df = pd.read_csv(CSV_FILES['products'])
-        print(f"  ✓ Read {len(df)} products from CSV")
-        
-        # Add product_category (same as department for now)
-        df['product_category'] = 'General'  # Will be updated later if needed
-        
-        # Load to database in chunks (large table)
-        total_rows = 0
-        for chunk_start in range(0, len(df), BATCH_SIZE):
-            chunk = df[chunk_start:chunk_start + BATCH_SIZE]
-            chunk.to_sql('Dim_Product', engine, if_exists='append', index=False, method='multi')
-            total_rows += len(chunk)
-            print(f"  ... {total_rows}/{len(df)} products loaded", end='\r')
-        
-        elapsed = time.time() - start_time
-        print(f"\n  ✓ Loaded {len(df)} records in {elapsed:.2f}s")
-        return True
-        
-    except Exception as e:
-        print(f"  ✗ Error: {e}")
-        return False
 
-def main():
-    """Main ETL process for dimension tables"""
-    print("="*60)
-    print("ETL: Loading Dimension Tables")
-    print("="*60)
-    
-    try:
-        engine = get_engine()
-        print("✓ Database connection established")
-        
-        # Load dimensions
-        success = True
-        success &= load_dim_department(engine)
-        success &= load_dim_aisle(engine)
-        success &= load_dim_product(engine)
-        
-        if success:
-            # Verify counts
-            print("\n" + "="*60)
-            print("Verification:")
-            print("="*60)
-            with engine.connect() as conn:
-                for table in ['Dim_Department', 'Dim_Aisle', 'Dim_Product']:
-                    result = conn.execute(text(f"SELECT COUNT(*) FROM {table}"))
-                    count = result.fetchone()[0]
-                    print(f"  {table}: {count:,} records")
-            
-            print("\n✓ All dimension tables loaded successfully!")
-            return 0
-        else:
-            print("\n✗ Some tables failed to load")
-            return 1
-            
-    except Exception as e:
-        print(f"\n✗ Fatal error: {e}")
-        return 1
+@contextmanager
+def _transaction(bind: DatabaseBind) -> Iterator[Connection]:
+    if isinstance(bind, Engine):
+        with bind.begin() as connection:
+            yield connection
+        return
+    yield bind
 
-if __name__ == '__main__':
+
+def _load_dimension(
+    bind: DatabaseBind,
+    *,
+    source_path: Path,
+    table_name: str,
+    transform: FrameTransform,
+    settings: Settings,
+) -> int:
+    loaded = 0
+    with _transaction(bind) as connection:
+        for source_chunk in pd.read_csv(source_path, chunksize=settings.chunk_size):
+            dimension_chunk = transform(source_chunk)
+            dimension_chunk.to_sql(
+                table_name,
+                connection,
+                if_exists="append",
+                index=False,
+                method="multi",
+                chunksize=settings.batch_size,
+            )
+            loaded += len(dimension_chunk)
+
+    if loaded == 0:
+        raise DataQualityError(f"{source_path.name}: no dimension rows were loaded")
+    return loaded
+
+
+def load_dim_department(bind: DatabaseBind, settings: Settings | None = None) -> int:
+    resolved = settings or get_settings()
+    require_source_files(resolved.csv_files, ["departments"])
+    return _load_dimension(
+        bind,
+        source_path=resolved.csv_files["departments"],
+        table_name="Dim_Department",
+        transform=transform_departments,
+        settings=resolved,
+    )
+
+
+def load_dim_aisle(bind: DatabaseBind, settings: Settings | None = None) -> int:
+    resolved = settings or get_settings()
+    require_source_files(resolved.csv_files, ["aisles"])
+    return _load_dimension(
+        bind,
+        source_path=resolved.csv_files["aisles"],
+        table_name="Dim_Aisle",
+        transform=transform_aisles,
+        settings=resolved,
+    )
+
+
+def load_dim_product(bind: DatabaseBind, settings: Settings | None = None) -> int:
+    resolved = settings or get_settings()
+    require_source_files(resolved.csv_files, ["products"])
+    return _load_dimension(
+        bind,
+        source_path=resolved.csv_files["products"],
+        table_name="Dim_Product",
+        transform=transform_products,
+        settings=resolved,
+    )
+
+
+def _table_count(connection: Connection, table_name: str) -> int:
+    allowed_tables = {"Dim_Department", "Dim_Aisle", "Dim_Product"}
+    if table_name not in allowed_tables:
+        raise ValueError(f"Unsupported dimension table: {table_name}")
+    return int(connection.execute(text(f"SELECT COUNT(*) FROM {table_name}")).scalar_one())
+
+
+def main(settings: Settings | None = None, engine: Engine | None = None) -> int:
+    """Load all dimensions atomically; exceptions deliberately propagate."""
+    resolved = settings or get_settings()
+    require_source_files(resolved.csv_files, ["departments", "aisles", "products"])
+    warehouse_engine = engine or get_engine(resolved)
+
+    print("ETL: loading dimension tables")
+    with warehouse_engine.begin() as connection:
+        loaded = {
+            "Dim_Department": load_dim_department(connection, resolved),
+            "Dim_Aisle": load_dim_aisle(connection, resolved),
+            "Dim_Product": load_dim_product(connection, resolved),
+        }
+
+    with warehouse_engine.connect() as connection:
+        for table_name, rows in loaded.items():
+            total = _table_count(connection, table_name)
+            print(f"  {table_name}: loaded {rows:,}; warehouse total {total:,}")
+    return 0
+
+
+if __name__ == "__main__":
     sys.exit(main())

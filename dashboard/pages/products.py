@@ -1,160 +1,238 @@
-import streamlit as st
-import pandas as pd
+"""Product and aisle analytics page."""
+
+from __future__ import annotations
+
 import plotly.express as px
+import streamlit as st
 
-@st.cache_data(ttl=86400, show_spinner="🏆 Loading top products...")
-def get_top_products(_engine):
-    return pd.read_sql("""
-        SELECT 
-            p.product_name,
-            d.department_name,
-            COUNT(DISTINCT fod.order_id) as orders,
-            COUNT(*) as total_items,
-            ROUND(AVG(fod.reordered) * 100, 1) as reorder_rate
-        FROM Fact_Order_Details fod
-        JOIN Dim_Product p ON fod.product_id = p.product_id
-        JOIN Dim_Department d ON p.department_id = d.department_id
-        GROUP BY p.product_id, p.product_name, d.department_name
-        ORDER BY orders DESC
-        LIMIT 20
-    """, _engine)
+from dashboard.components import (
+    download_frame,
+    format_integer,
+    format_percent,
+    insight_card,
+    load_repository_data,
+    page_header,
+    plotly_chart,
+    require_columns,
+)
+from dashboard.data import AnalyticsRepository
+from dashboard.styles import SEQUENTIAL_SCALE, style_figure
 
-@st.cache_data(ttl=86400, show_spinner="🔁 Loading reorder rates...")
-def get_aisle_reorder(_engine):
-    return pd.read_sql("""
-        SELECT 
-            a.aisle_name,
-            ROUND(AVG(fod.reordered) * 100, 2) as reorder_rate,
-            COUNT(*) as items
-        FROM Fact_Order_Details fod
-        JOIN Dim_Product p ON fod.product_id = p.product_id
-        JOIN Dim_Aisle a ON p.aisle_id = a.aisle_id
-        GROUP BY a.aisle_id, a.aisle_name
-        HAVING COUNT(*) >= 10000
-        ORDER BY reorder_rate DESC
-        LIMIT 15
-    """, _engine)
 
-def show(engine):
-    st.header("🏆 Product Analytics")
-    st.markdown("Analyze best-selling products and reorder patterns")
-    
-    # Top Products
-    st.subheader("🥇 Top 20 Best-Selling Products")
-    
-    try:
-        with st.spinner("Loading top products..."):
-            df_top = get_top_products(engine)
-        
-        if not df_top.empty:
-            fig = px.bar(
-                df_top, 
-                x='orders', 
-                y='product_name',
-                color='reorder_rate',
-                orientation='h',
-                color_continuous_scale='Viridis',
-                hover_data=['department_name', 'total_items'],
+def show(repository: AnalyticsRepository) -> None:
+    page_header(
+        "Products & aisles",
+        (
+            "Explore high-volume products and repeat-purchase behavior with explicit "
+            "support thresholds and department filters."
+        ),
+        eyebrow="Merchandising signals",
+    )
+
+    departments = load_repository_data(
+        repository,
+        "departments",
+        loading_label="Loading department filters…",
+    )
+    department_options = ["All departments"]
+    if require_columns(
+        departments,
+        ("department_name",),
+        context="Department filter",
+    ):
+        department_options.extend(
+            sorted(departments["department_name"].dropna().astype(str).unique())
+        )
+
+    st.subheader("Product ranking")
+    filter_left, filter_right = st.columns(2)
+    with filter_left:
+        selected_department = st.selectbox(
+            "Department",
+            department_options,
+            help="Restricts the warehouse aggregate before ranking products.",
+        )
+    with filter_right:
+        visible_limit = st.slider(
+            "Products shown",
+            min_value=5,
+            max_value=30,
+            value=15,
+            step=5,
+        )
+
+    repository_department = (
+        None if selected_department == "All departments" else selected_department
+    )
+    products = load_repository_data(
+        repository,
+        "products",
+        loading_label="Loading product ranking…",
+        limit=100,
+        department=repository_department,
+    )
+    product_ok = require_columns(
+        products,
+        (
+            "product_name",
+            "department_name",
+            "aisle_name",
+            "orders",
+            "total_items",
+            "reorder_rate_pct",
+        ),
+        context="Product ranking",
+    )
+    if product_ok:
+        search_term = st.text_input(
+            "Search within up to 100 loaded top products",
+            placeholder="Try banana, milk, or organic…",
+            help=(
+                "This is a client-side search over the ranked result set, not a "
+                "full-catalogue database search."
+            ),
+        ).strip()
+        filtered = products
+        if search_term:
+            filtered = products[
+                products["product_name"]
+                .astype(str)
+                .str.contains(
+                    search_term,
+                    case=False,
+                    regex=False,
+                    na=False,
+                )
+            ]
+        visible = filtered.head(visible_limit).copy()
+        if visible.empty:
+            st.info("No loaded top product matches this search. Clear the search to continue.")
+        else:
+            chart_frame = visible.sort_values("orders", ascending=True)
+            product_chart = px.bar(
+                chart_frame,
+                x="orders",
+                y="product_name",
+                orientation="h",
+                color="reorder_rate_pct",
+                color_continuous_scale=SEQUENTIAL_SCALE,
+                title="Ranked by distinct orders",
                 labels={
-                    'orders': 'Number of Orders',
-                    'product_name': 'Product Name',
-                    'reorder_rate': 'Reorder Rate (%)'
-                }
+                    "orders": "Distinct orders",
+                    "product_name": "Product",
+                    "reorder_rate_pct": "Reorder rate (%)",
+                },
+                hover_data={"department_name": True, "aisle_name": True},
             )
-            fig.update_layout(
-                height=600,
-                yaxis={'categoryorder': 'total ascending'}
+            product_chart.update_traces(
+                hovertemplate=(
+                    "%{y}<br>%{x:,.0f} distinct orders"
+                    "<br>Reorder rate: %{marker.color:.1f}%<extra></extra>"
+                )
             )
-            st.plotly_chart(fig, width='stretch')
-            
-            # Show top 5 in table
-            st.markdown("**📊 Top 5 Products Detail:**")
+            height = max(400, min(720, 34 * len(chart_frame) + 180))
+            plotly_chart(
+                style_figure(product_chart, height=height),
+                key="products-ranking",
+            )
+            leader = visible.iloc[0]
+            insight_card(
+                "Highest-volume result",
+                (
+                    f"{leader['product_name']} appears in "
+                    f"{format_integer(leader['orders'])} distinct orders with a "
+                    f"{format_percent(leader['reorder_rate_pct'])} reorder rate."
+                ),
+            )
             st.dataframe(
-                df_top.head(5).style.format({
-                    'orders': '{:,}',
-                    'total_items': '{:,}',
-                    'reorder_rate': '{:.1f}%'
-                }),
-                width='stretch'
+                visible,
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "orders": st.column_config.NumberColumn(format="%d"),
+                    "total_items": st.column_config.NumberColumn(format="%d"),
+                    "reorder_rate_pct": st.column_config.NumberColumn(format="%.1f%%"),
+                },
             )
-        else:
-            st.info("No data available. Please run ETL pipeline first.")
-    except Exception as e:
-        st.error(f"Error loading data: {str(e)}")
-    
-    # Reorder Rate by Aisle
-    st.markdown("---")
-    st.subheader("🔁 Reorder Rate by Aisle (Top 15)")
-    
-    try:
-        with st.spinner("Loading aisle data..."):
-            df_aisle = get_aisle_reorder(engine)
-        
-        if not df_aisle.empty:
-            fig = px.bar(
-                df_aisle,
-                x='reorder_rate',
-                y='aisle_name',
-                orientation='h',
-                color='reorder_rate',
-                color_continuous_scale='RdYlGn',
-                labels={
-                    'reorder_rate': 'Reorder Rate (%)',
-                    'aisle_name': 'Aisle Name'
-                }
+            download_frame(
+                visible,
+                label="Download filtered products",
+                file_name="instacart-product-ranking.csv",
+                key="products-download",
             )
-            fig.update_layout(
-                height=500,
-                yaxis={'categoryorder': 'total ascending'}
+
+    st.subheader("Aisle loyalty")
+    aisle_left, aisle_right = st.columns(2)
+    with aisle_left:
+        min_items = int(
+            st.number_input(
+                "Minimum line-item support",
+                min_value=0,
+                max_value=1_000_000,
+                value=10_000,
+                step=5_000,
+                help="Removes tiny aisles whose reorder rate is less reliable.",
             )
-            st.plotly_chart(fig, width='stretch')
-            
-            # Highlight best aisle
-            best_aisle = df_aisle.iloc[0]
-            st.success(f"🌟 **Best Reorder Rate:** {best_aisle['aisle_name']} - {best_aisle['reorder_rate']:.1f}%")
-        else:
-            st.info("No data available. Please run ETL pipeline first.")
-    except Exception as e:
-        st.error(f"Error loading data: {str(e)}")
-    
-    # # Product Search
-    # st.markdown("---")
-    # st.subheader("🔍 Product Search")
-    
-    # search_term = st.text_input("Search product name:", placeholder="e.g., organic banana")
-    
-    # if search_term:
-    #     try:
-    #         df_search = pd.read_sql(f"""
-    #             SELECT 
-    #                 p.product_name,
-    #                 d.department_name,
-    #                 a.aisle_name,
-    #                 COUNT(DISTINCT fod.order_id) as orders,
-    #                 COUNT(*) as total_items,
-    #                 ROUND(AVG(fod.reordered) * 100, 1) as reorder_rate
-    #             FROM Fact_Order_Details fod
-    #             JOIN Dim_Product p ON fod.product_id = p.product_id
-    #             JOIN Dim_Department d ON p.department_id = d.department_id
-    #             JOIN Dim_Aisle a ON p.aisle_id = a.aisle_id
-    #             WHERE LOWER(p.product_name) LIKE LOWER('%{search_term}%')
-    #             GROUP BY p.product_id, p.product_name, d.department_name, a.aisle_name
-    #             ORDER BY orders DESC
-    #             LIMIT 50
-    #         """, engine)
-            
-    #         if not df_search.empty:
-    #             st.success(f"Found {len(df_search)} products matching '{search_term}'")
-    #             st.dataframe(
-    #                 df_search.style.format({
-    #                     'orders': '{:,}',
-    #                     'total_items': '{:,}',
-    #                     'reorder_rate': '{:.1f}%'
-    #                 }),
-    #                 width='stretch',
-    #                 height=400
-    #             )
-    #         else:
-    #             st.warning(f"No products found matching '{search_term}'")
-    #     except Exception as e:
-    #         st.error(f"Error searching: {str(e)}")
+        )
+    with aisle_right:
+        aisle_limit = st.slider(
+            "Aisles shown",
+            min_value=5,
+            max_value=30,
+            value=15,
+            step=5,
+        )
+    aisles = load_repository_data(
+        repository,
+        "aisles",
+        loading_label="Loading aisle aggregates…",
+        limit=aisle_limit,
+        min_items=min_items,
+    )
+    aisle_ok = require_columns(
+        aisles,
+        ("aisle_name", "reorder_rate_pct", "items"),
+        context="Aisle ranking",
+    )
+    if aisle_ok:
+        aisle_chart_frame = aisles.sort_values("reorder_rate_pct", ascending=True)
+        aisle_chart = px.bar(
+            aisle_chart_frame,
+            x="reorder_rate_pct",
+            y="aisle_name",
+            orientation="h",
+            color="items",
+            color_continuous_scale=SEQUENTIAL_SCALE,
+            title="Reorder rate with minimum support applied",
+            labels={
+                "reorder_rate_pct": "Reorder rate (%)",
+                "aisle_name": "Aisle",
+                "items": "Line items",
+            },
+        )
+        aisle_chart.update_traces(
+            hovertemplate=(
+                "%{y}<br>Reorder rate: %{x:.1f}%<br>%{marker.color:,.0f} line items<extra></extra>"
+            )
+        )
+        plotly_chart(
+            style_figure(aisle_chart, height=max(420, 32 * len(aisles) + 160)),
+            key="products-aisle-ranking",
+        )
+        best_aisle = aisles.loc[aisles["reorder_rate_pct"].idxmax()]
+        insight_card(
+            "Strongest repeat signal",
+            (
+                f"{str(best_aisle['aisle_name']).title()} leads this supported set at "
+                f"{format_percent(best_aisle['reorder_rate_pct'])}."
+            ),
+        )
+        st.dataframe(
+            aisles,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "reorder_rate_pct": st.column_config.NumberColumn(format="%.1f%%"),
+                "items": st.column_config.NumberColumn(format="%d"),
+            },
+        )

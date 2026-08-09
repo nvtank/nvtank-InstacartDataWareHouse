@@ -1,0 +1,5 @@
+product_id,product_name,aisle_id,department_id
+10,Banana,1,1
+11,Honeycrisp Apple,1,1
+20,Whole Milk,2,2
+21,Plain Yogurt,2,2

@@ -34,8 +34,15 @@ SELECT
     COUNT(*) as order_count,
     AVG(total_items) as avg_items
 FROM Fact_Orders
-WHERE order_id BETWEEN 1000000 AND 1500000;
--- Expected: Scan fewer partitions
+WHERE order_dow = 0;
+-- Expected: p_sunday only. Fact_Orders is partitioned by order_dow, not order_id.
+
+-- Test 3b: RANGE pruning on the table that is partitioned by order_id
+EXPLAIN PARTITIONS
+SELECT COUNT(*) AS line_items
+FROM Fact_Order_Details
+WHERE order_id >= 1000000 AND order_id < 1500000;
+-- Expected: p2 only
 
 -- Test 4: Performance comparison queries
 -- Query A: With partition benefit

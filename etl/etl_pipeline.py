@@ -1,220 +1,274 @@
-#!/usr/bin/env python3
-"""
-Complete ETL Pipeline for Instacart Data Warehouse
-Orchestrates the entire ETL process
-"""
+"""Fail-fast command line orchestrator for the Instacart warehouse load."""
+
+from __future__ import annotations
+
+import argparse
+import json
 import sys
 import time
-from sqlalchemy import text
+import uuid
+from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
 
-# Import ETL modules
-from config import get_engine
-import load_dimensions
-import load_facts
+from sqlalchemy import inspect, text
+from sqlalchemy.engine import Connection, Engine
 
-def check_prerequisites():
-    """Check if database schema exists"""
-    print("Checking prerequisites...")
+from . import load_dimensions, load_facts
+from .config import PROJECT_ROOT, Settings, get_engine, get_settings
+from .quality import require_source_files, run_warehouse_checks
+from .update_fact_metrics import update_all_metrics
+
+REQUIRED_TABLES = (
+    "Dim_Time",
+    "Dim_Department",
+    "Dim_Aisle",
+    "Dim_Product",
+    "Dim_User",
+    "Fact_Orders",
+    "Fact_Order_Details",
+)
+MUTABLE_TABLES = (
+    "Fact_Order_Details",
+    "Fact_Orders",
+    "Dim_User",
+    "Dim_Product",
+    "Dim_Aisle",
+    "Dim_Department",
+)
+DEFAULT_REPORT_PATH = PROJECT_ROOT / "artifacts" / "etl" / "latest.json"
+
+
+class PipelineError(RuntimeError):
+    """Raised for an unsafe or incomplete ETL precondition."""
+
+
+@dataclass(frozen=True, slots=True)
+class StageReport:
+    name: str
+    rows: int
+    elapsed_seconds: float
+
+
+def _utc_now() -> str:
+    return datetime.now(UTC).isoformat(timespec="seconds")
+
+
+def check_schema(engine: Engine) -> None:
+    discovered = {name.casefold(): name for name in inspect(engine).get_table_names()}
+    missing = [table for table in REQUIRED_TABLES if table.casefold() not in discovered]
+    if missing:
+        raise PipelineError(
+            f"Missing warehouse tables: {', '.join(missing)}. Run `make schema` first."
+        )
+
+
+def table_counts(bind: Engine | Connection) -> dict[str, int]:
+    owns_connection = isinstance(bind, Engine)
+    connection = bind.connect() if owns_connection else bind
     try:
-        engine = get_engine()
-        with engine.connect() as conn:
-            result = conn.execute(text("SHOW TABLES"))
-            tables = [row[0] for row in result.fetchall()]
-            
-            required_tables = [
-                'Dim_Time', 'Dim_Department', 'Dim_Aisle', 'Dim_Product', 
-                'Dim_User', 'Fact_Orders', 'Fact_Order_Details'
-            ]
-            
-            missing = [t for t in required_tables if t not in tables]
-            
-            if missing:
-                print(f"✗ Missing tables: {', '.join(missing)}")
-                print("  Please run: ./sql/run_all_sql.sh")
-                return False
-            
-            print(f"✓ All {len(required_tables)} tables exist")
-            return True
-            
-    except Exception as e:
-        print(f"✗ Database connection failed: {e}")
-        return False
+        return {
+            table: int(connection.execute(text(f"SELECT COUNT(*) FROM {table}")).scalar_one())
+            for table in REQUIRED_TABLES
+        }
+    finally:
+        if owns_connection:
+            connection.close()
 
-def check_data_already_loaded(engine):
-    """Check if data is already loaded"""
-    with engine.connect() as conn:
-        result = conn.execute(text("SELECT COUNT(*) FROM Dim_Product"))
-        count = result.fetchone()[0]
-        return count > 0
 
-def update_fact_metrics(engine):
-    """Update aggregated metrics in Fact_Orders"""
-    print("\n" + "="*60)
-    print("Updating Fact Metrics...")
-    print("="*60)
-    
-    # Update total_items in Fact_Orders
-    print("\n[1/2] Updating total_items in Fact_Orders...")
-    start = time.time()
-    try:
-        with engine.connect() as conn:
-            conn.execute(text("""
-                UPDATE Fact_Orders fo
-                JOIN (
-                    SELECT order_id, COUNT(*) as item_count
-                    FROM Fact_Order_Details
-                    GROUP BY order_id
-                ) fod ON fo.order_id = fod.order_id
-                SET fo.total_items = fod.item_count
-            """))
-            conn.commit()
-        print(f"  ✓ Updated in {time.time() - start:.2f}s")
-    except Exception as e:
-        print(f"  ✗ Error: {e}")
-    
-    # Update reorder_ratio in Fact_Orders
-    print("\n[2/2] Updating reorder_ratio in Fact_Orders...")
-    start = time.time()
-    try:
-        with engine.connect() as conn:
-            conn.execute(text("""
-                UPDATE Fact_Orders fo
-                JOIN (
-                    SELECT 
-                        order_id,
-                        SUM(reordered) / COUNT(*) as reorder_ratio
-                    FROM Fact_Order_Details
-                    GROUP BY order_id
-                ) fod ON fo.order_id = fod.order_id
-                SET fo.reorder_ratio = fod.reorder_ratio
-            """))
-            conn.commit()
-        print(f"  ✓ Updated in {time.time() - start:.2f}s")
-    except Exception as e:
-        print(f"  ✗ Error: {e}")
+def ensure_empty_load_target(engine: Engine) -> None:
+    populated = {
+        table: count
+        for table, count in table_counts(engine).items()
+        if table in MUTABLE_TABLES and count > 0
+    }
+    if populated:
+        summary = ", ".join(f"{table}={count:,}" for table, count in populated.items())
+        raise PipelineError(
+            "Warehouse already contains load data "
+            f"({summary}). Refusing to append duplicate facts; use --reset-data --yes explicitly."
+        )
 
-def populate_dim_user(engine):
-    """Populate Dim_User from Fact_Orders aggregates"""
-    print("\n" + "="*60)
-    print("Populating Dim_User...")
-    print("="*60)
-    
-    start = time.time()
-    try:
-        with engine.connect() as conn:
-            # Insert user aggregates
-            conn.execute(text("""
-                INSERT INTO Dim_User (
-                    user_id,
-                    user_segment,
-                    first_order_dow,
-                    avg_basket_size,
-                    total_orders,
-                    avg_days_between_orders
+
+def reset_load_data(engine: Engine) -> None:
+    """Clear only ETL-owned rows; Dim_Time and the database itself are preserved."""
+    with engine.connect() as connection:
+        connection.exec_driver_sql("SET FOREIGN_KEY_CHECKS=0")
+        try:
+            for table in MUTABLE_TABLES:
+                connection.exec_driver_sql(f"TRUNCATE TABLE {table}")
+        finally:
+            connection.exec_driver_sql("SET FOREIGN_KEY_CHECKS=1")
+
+
+def _timed_stage(name: str, operation: Any) -> StageReport:
+    started = time.perf_counter()
+    rows = int(operation())
+    result = StageReport(name=name, rows=rows, elapsed_seconds=time.perf_counter() - started)
+    print(f"[{name}] {rows:,} rows in {result.elapsed_seconds:.1f}s")
+    return result
+
+
+def run_pipeline(
+    settings: Settings,
+    *,
+    reset_data: bool = False,
+    validate_only: bool = False,
+) -> tuple[list[StageReport], dict[str, int], list[dict[str, Any]]]:
+    engine = get_engine(settings)
+    check_schema(engine)
+
+    if validate_only:
+        checks = run_warehouse_checks(engine)
+        return [], table_counts(engine), [asdict(check) | {"passed": check.passed} for check in checks]
+
+    require_source_files(settings.csv_files, settings.csv_files.keys())
+    if reset_data:
+        reset_load_data(engine)
+    ensure_empty_load_target(engine)
+
+    stages: list[StageReport] = []
+
+    def load_all_dimensions() -> int:
+        with engine.begin() as connection:
+            return sum(
+                (
+                    load_dimensions.load_dim_department(connection, settings),
+                    load_dimensions.load_dim_aisle(connection, settings),
+                    load_dimensions.load_dim_product(connection, settings),
                 )
-                SELECT 
-                    user_id,
-                    CASE 
-                        WHEN COUNT(*) >= 100 THEN 'VIP'
-                        WHEN COUNT(*) >= 10 THEN 'Regular'
-                        ELSE 'New'
-                    END as user_segment,
-                    MIN(order_dow) as first_order_dow,
-                    AVG(total_items) as avg_basket_size,
-                    COUNT(*) as total_orders,
-                    AVG(days_since_prior_order) as avg_days_between_orders
-                FROM Fact_Orders
-                GROUP BY user_id
-            """))
-            conn.commit()
-            
-        elapsed = time.time() - start
-        
-        # Get count
-        with engine.connect() as conn:
-            result = conn.execute(text("SELECT COUNT(*) FROM Dim_User"))
-            count = result.fetchone()[0]
-        
-        print(f"  ✓ Populated {count:,} users in {elapsed:.2f}s")
-        
-    except Exception as e:
-        print(f"  ✗ Error: {e}")
+            )
 
-def main():
-    """Main ETL orchestration"""
-    print("="*60)
-    print("INSTACART DATA WAREHOUSE - COMPLETE ETL PIPELINE")
-    print("="*60)
-    
-    start_time = time.time()
-    
-    # Step 0: Check prerequisites
-    if not check_prerequisites():
-        return 1
-    
-    engine = get_engine()
-    
-    # Check if already loaded
-    if check_data_already_loaded(engine):
-        print("\n⚠ WARNING: Data already exists in database!")
-        response = input("Continue and append more data? (yes/no): ")
-        if response.lower() != 'yes':
-            print("Aborted.")
-            return 0
-    
-    # Step 1: Load Dimensions
-    print("\n" + "="*60)
-    print("PHASE 1: Loading Dimension Tables")
-    print("="*60)
-    if load_dimensions.main() != 0:
-        print("✗ Dimension loading failed")
-        return 1
-    
-    # Step 2: Load Facts
-    print("\n" + "="*60)
-    print("PHASE 2: Loading Fact Tables")
-    print("="*60)
-    print("⏱ This will take approximately 10-20 minutes...")
-    if load_facts.main() != 0:
-        print("✗ Fact loading failed")
-        return 1
-    
-    # Step 3: Update metrics
-    update_fact_metrics(engine)
-    
-    # Step 4: Populate Dim_User
-    populate_dim_user(engine)
-    
-    # Final verification
-    print("\n" + "="*60)
-    print("FINAL VERIFICATION")
-    print("="*60)
-    
-    with engine.connect() as conn:
-        tables = [
-            'Dim_Time', 'Dim_Department', 'Dim_Aisle', 'Dim_Product',
-            'Dim_User', 'Fact_Orders', 'Fact_Order_Details'
-        ]
-        
-        for table in tables:
-            result = conn.execute(text(f"SELECT COUNT(*) FROM {table}"))
-            count = result.fetchone()[0]
-            print(f"  {table:25s}: {count:>15,} records")
-    
-    elapsed = time.time() - start_time
-    minutes = int(elapsed // 60)
-    seconds = int(elapsed % 60)
-    
-    print("\n" + "="*60)
-    print(f"✓ ETL PIPELINE COMPLETED in {minutes}m {seconds}s")
-    print("="*60)
-    print("\nNext steps:")
-    print("  1. Check partitions: mysql < sql/10_check_partitions.sql")
-    print("  2. Run maintenance: mysql < sql/11_maintenance.sql")
-    print("  3. Create indexes: mysql < sql/09_additional_indexes.sql")
-    print("  4. Start analysis: python analysis/queries.py")
-    
-    return 0
+    stages.append(_timed_stage("dimensions", load_all_dimensions))
+    stages.append(
+        _timed_stage("orders", lambda: load_facts.load_fact_orders(engine, settings))
+    )
+    stages.append(
+        _timed_stage(
+            "order_details", lambda: load_facts.load_fact_order_details(engine, settings)
+        )
+    )
 
-if __name__ == '__main__':
-    sys.exit(main())
+    metric_result = update_all_metrics(engine)
+    stages.append(
+        StageReport(
+            name="derived_metrics",
+            rows=metric_result.orders_updated + metric_result.users_upserted,
+            elapsed_seconds=metric_result.elapsed_seconds,
+        )
+    )
+    print(
+        "[derived_metrics] "
+        f"{metric_result.orders_updated:,} order rows and "
+        f"{metric_result.users_upserted:,} user rows affected "
+        f"in {metric_result.elapsed_seconds:.1f}s"
+    )
+
+    checks = run_warehouse_checks(engine)
+    quality_results = [asdict(check) | {"passed": check.passed} for check in checks]
+    return stages, table_counts(engine), quality_results
+
+
+def _write_report(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Load, reconcile, and validate the Instacart MariaDB warehouse."
+    )
+    parser.add_argument(
+        "--reset-data",
+        action="store_true",
+        help="truncate ETL-owned tables before loading (requires --yes)",
+    )
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="confirm the destructive --reset-data operation",
+    )
+    parser.add_argument(
+        "--validate-only",
+        action="store_true",
+        help="run warehouse contracts without loading source files",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="validate configuration and source-file presence without connecting",
+    )
+    parser.add_argument(
+        "--report",
+        type=Path,
+        default=DEFAULT_REPORT_PATH,
+        help="machine-readable ETL report path",
+    )
+    return parser
+
+
+def cli(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.reset_data and not args.yes:
+        parser.error("--reset-data is destructive and requires --yes")
+    if args.reset_data and args.validate_only:
+        parser.error("--reset-data cannot be combined with --validate-only")
+
+    settings = get_settings()
+    if args.dry_run:
+        require_source_files(settings.csv_files, settings.csv_files.keys())
+        print(f"Configuration valid: {settings.safe_summary()}")
+        print("All required source files are present.")
+        return 0
+
+    run_id = str(uuid.uuid4())
+    started_at = _utc_now()
+    started = time.perf_counter()
+    payload: dict[str, Any] = {
+        "run_id": run_id,
+        "started_at": started_at,
+        "configuration": settings.safe_summary(),
+        "mode": "validate" if args.validate_only else "load",
+    }
+
+    try:
+        stages, counts, checks = run_pipeline(
+            settings,
+            reset_data=args.reset_data,
+            validate_only=args.validate_only,
+        )
+        payload.update(
+            {
+                "status": "succeeded",
+                "stages": [asdict(stage) for stage in stages],
+                "table_counts": counts,
+                "quality_checks": checks,
+            }
+        )
+        exit_code = 0
+    except Exception as exc:  # CLI boundary: report failure, then return non-zero.
+        payload.update(
+            {
+                "status": "failed",
+                "error_type": exc.__class__.__name__,
+                "error": str(exc),
+            }
+        )
+        print(f"ETL failed: {exc.__class__.__name__}: {exc}", file=sys.stderr)
+        exit_code = 1
+
+    payload["finished_at"] = _utc_now()
+    payload["elapsed_seconds"] = round(time.perf_counter() - started, 3)
+    _write_report(args.report, payload)
+    print(f"ETL report: {args.report}")
+    return exit_code
+
+
+def main() -> int:
+    return cli()
+
+
+if __name__ == "__main__":
+    raise SystemExit(cli())

@@ -61,9 +61,11 @@ logs/
 etl_output.log
 *.log.*
 
-# Data files (large CSV files - uncomment if you don't want to commit data)
-# data/
-# *.csv
+# Source data is downloaded separately from Kaggle and must never enter Git.
+/data/
+*.csv
+!docs/**/*.csv
+!tests/fixtures/**/*.csv
 
 # ETL output
 etl_output.log
@@ -79,11 +81,12 @@ mining/results/
 *.jpg
 *.jpeg
 *.pdf
+!docs/assets/*.png
 mining/results/*.csv
 mining/results/*.png
 
-# Streamlit
-.streamlit/
+# Streamlit configuration is versioned; secrets are not.
+.streamlit/secrets.toml
 
 # OS
 .DS_Store
@@ -124,3 +127,10 @@ docker-compose.override.yml
 check_etl_progress.sh.log
 nohup.out
 
+# Local artifacts and tooling
+.ruff_cache/
+.mypy_cache/
+coverage.xml
+coverage-*.xml
+site/
+artifacts/

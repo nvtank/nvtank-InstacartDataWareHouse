@@ -1,12 +1,12 @@
 
 USE instacart_dwh;
 
-CREATE TABLE Fact_Orders (
+CREATE TABLE IF NOT EXISTS Fact_Orders (
     order_id INT COMMENT 'Business key from source',
     user_id INT NOT NULL,
     time_id INT NOT NULL,
     order_number INT NOT NULL COMMENT 'Order sequence for this user',
-    days_since_prior_order FLOAT DEFAULT NULL 
+    days_since_prior_order DECIMAL(6,2) DEFAULT NULL
         COMMENT 'Days since previous order (NULL for first order)',
     total_items INT NOT NULL DEFAULT 0 
         COMMENT 'Total products in this order (updated later)',
@@ -24,9 +24,15 @@ CREATE TABLE Fact_Orders (
     INDEX idx_user (user_id),
     INDEX idx_time (time_id),
     INDEX idx_order_number (order_number),
-    INDEX idx_days_since_prior (days_since_prior_order)
+    INDEX idx_days_since_prior (days_since_prior_order),
+    CONSTRAINT chk_order_dow CHECK (order_dow BETWEEN 0 AND 6),
+    CONSTRAINT chk_order_number CHECK (order_number > 0),
+    CONSTRAINT chk_days_since_prior CHECK (
+        days_since_prior_order IS NULL OR days_since_prior_order >= 0
+    ),
+    CONSTRAINT chk_reorder_ratio CHECK (reorder_ratio BETWEEN 0 AND 1)
 ) ENGINE=InnoDB
-  COMMENT='Order summary fact table (3.4M records)'
+  COMMENT='Order summary fact table (prior and train orders)'
   PARTITION BY LIST (order_dow) (
     PARTITION p_sunday VALUES IN (0) COMMENT 'Sunday orders',
     PARTITION p_monday VALUES IN (1) COMMENT 'Monday orders',

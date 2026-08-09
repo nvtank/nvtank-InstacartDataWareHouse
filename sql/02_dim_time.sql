@@ -1,7 +1,7 @@
 
 USE instacart_dwh;
 
-CREATE TABLE Dim_Time (
+CREATE TABLE IF NOT EXISTS Dim_Time (
     time_id INT PRIMARY KEY COMMENT 'Surrogate key: dow*100 + hour',
     order_dow TINYINT NOT NULL COMMENT 'Day of week (0=Sunday, 6=Saturday)',
     dow_name VARCHAR(10) NOT NULL COMMENT 'Sunday, Monday, ...',
@@ -11,11 +11,13 @@ CREATE TABLE Dim_Time (
     
     INDEX idx_dow (order_dow),
     INDEX idx_hour (order_hour),
-    INDEX idx_weekend (is_weekend)
+    INDEX idx_weekend (is_weekend),
+    CONSTRAINT chk_time_dow CHECK (order_dow BETWEEN 0 AND 6),
+    CONSTRAINT chk_time_hour CHECK (order_hour BETWEEN 0 AND 23)
 ) ENGINE=InnoDB COMMENT='Time dimension for order analysis';
 
 -- Pre-populate Time dimension (168 rows)
-INSERT INTO Dim_Time (time_id, order_dow, dow_name, order_hour, hour_range, is_weekend)
+INSERT IGNORE INTO Dim_Time (time_id, order_dow, dow_name, order_hour, hour_range, is_weekend)
 SELECT 
     dow * 100 + hour AS time_id,
     dow AS order_dow,

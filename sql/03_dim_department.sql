@@ -1,7 +1,7 @@
 
 USE instacart_dwh;
 
-CREATE TABLE Dim_Department (
+CREATE TABLE IF NOT EXISTS Dim_Department (
     department_id INT PRIMARY KEY COMMENT 'Business key from source',
     department_name VARCHAR(50) NOT NULL,
     dept_category VARCHAR(20) NOT NULL DEFAULT 'General' 

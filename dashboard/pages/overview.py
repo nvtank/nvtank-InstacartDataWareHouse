@@ -1,190 +1,217 @@
-import streamlit as st
+"""Executive overview page."""
+
+from __future__ import annotations
+
 import pandas as pd
 import plotly.express as px
-from sqlalchemy import text
+import streamlit as st
 
-# Tăng thời gian cache lên 30 phút (1800 giây) vì data không thay đổi thường xuyên
-# Thêm show_spinner để hiển thị loading indicator
+from dashboard.components import (
+    download_frame,
+    format_compact_number,
+    format_decimal,
+    format_percent,
+    insight_card,
+    load_repository_data,
+    page_header,
+    plotly_chart,
+    require_columns,
+)
+from dashboard.data import AnalyticsRepository
+from dashboard.styles import COLORS, SEQUENTIAL_SCALE, style_figure
 
-@st.cache_data(ttl=86400, show_spinner="📊 Loading orders data...")
-def get_total_orders(_engine):
-    """Get total number of orders (cached for 30 minutes)"""
-    return pd.read_sql("SELECT COUNT(*) as cnt FROM Fact_Orders", _engine).iloc[0, 0]
 
-@st.cache_data(ttl=86400, show_spinner="👥 Loading users data...")
-def get_total_users(_engine):
-    """Get total number of users (cached for 30 minutes)"""
-    return pd.read_sql("SELECT COUNT(*) as cnt FROM Dim_User", _engine).iloc[0, 0]
+def _condense_departments(frame: pd.DataFrame, top_n: int = 8) -> pd.DataFrame:
+    ordered = frame.sort_values("market_share_pct", ascending=False).reset_index(drop=True)
+    leaders = ordered.head(top_n).copy()
+    remainder = ordered.iloc[top_n:]
+    if not remainder.empty:
+        leaders.loc[len(leaders)] = {
+            "department_name": "All other departments",
+            "orders": remainder["orders"].sum(),
+            "total_items": remainder["total_items"].sum(),
+            "reorder_rate_pct": (
+                (remainder["reorder_rate_pct"] * remainder["total_items"]).sum()
+                / remainder["total_items"].sum()
+            ),
+            "unique_products": remainder["unique_products"].sum(),
+            "market_share_pct": remainder["market_share_pct"].sum(),
+        }
+    return leaders.sort_values("market_share_pct", ascending=True)
 
-@st.cache_data(ttl=86400, show_spinner="🛍️ Loading products data...")
-def get_total_products(_engine):
-    """Get total number of products (cached for 30 minutes)"""
-    return pd.read_sql("SELECT COUNT(*) as cnt FROM Dim_Product", _engine).iloc[0, 0]
 
-@st.cache_data(ttl=86400, show_spinner="🛒 Calculating basket size...")
-def get_avg_basket(_engine):
-    """Get average basket size (cached for 30 minutes)"""
-    result = pd.read_sql("""
-        SELECT AVG(total_items) as avg 
-        FROM Fact_Orders 
-        WHERE total_items > 0
-    """, _engine)
-    return result.iloc[0, 0] if not result.empty and result.iloc[0, 0] else None
+def show(repository: AnalyticsRepository) -> None:
+    page_header(
+        "Executive overview",
+        (
+            "A decision-focused view of order volume, customer reach, basket behavior, "
+            "and category mix for the current warehouse snapshot."
+        ),
+        eyebrow="Instacart Decision Intelligence",
+    )
 
-@st.cache_data(ttl=86400, show_spinner="📅 Loading weekly trends...")
-def get_orders_by_dow(_engine):
-    """Get orders by day of week (cached for 30 minutes)"""
-    return pd.read_sql("""
-        SELECT 
-            t.dow_name,
-            t.order_dow,
-            COUNT(*) as orders
-        FROM Fact_Orders fo
-        JOIN Dim_Time t ON fo.time_id = t.time_id
-        GROUP BY t.order_dow, t.dow_name
-        ORDER BY t.order_dow
-    """, _engine)
+    kpis = load_repository_data(
+        repository,
+        "overview_kpis",
+        loading_label="Loading snapshot KPIs…",
+    )
+    if not require_columns(
+        kpis,
+        (
+            "total_orders",
+            "total_users",
+            "total_products",
+            "avg_basket_size",
+            "avg_reorder_rate_pct",
+        ),
+        context="Overview KPI",
+    ):
+        return
 
-@st.cache_data(ttl=86400, show_spinner="🏪 Loading department data...")
-def get_market_share(_engine):
-    """Get market share by department (cached for 30 minutes)"""
-    return pd.read_sql("""
-        SELECT 
-            d.department_name,
-            COUNT(*) as items
-        FROM Fact_Order_Details fod
-        JOIN Dim_Product p ON fod.product_id = p.product_id
-        JOIN Dim_Department d ON p.department_id = d.department_id
-        GROUP BY d.department_name
-        ORDER BY items DESC
-        LIMIT 10
-    """, _engine)
+    row = kpis.iloc[0]
+    st.subheader("Snapshot KPIs")
+    first, second = st.columns(2)
+    with first:
+        orders, customers = st.columns(2)
+        orders.metric("Orders", format_compact_number(row["total_orders"]))
+        customers.metric("Customers", format_compact_number(row["total_users"]))
+    with second:
+        basket, reorder = st.columns(2)
+        basket.metric("Average basket", format_decimal(row["avg_basket_size"]))
+        reorder.metric(
+            "Mean order reorder ratio",
+            format_percent(row["avg_reorder_rate_pct"]),
+        )
+    st.caption(
+        f"Catalogue coverage: {format_compact_number(row['total_products'])} products · "
+        f"{format_compact_number(row.get('total_departments'))} departments · "
+        f"{format_compact_number(row.get('total_aisles'))} aisles."
+    )
 
-@st.cache_data(ttl=86400, show_spinner="⏰ Loading hourly patterns...")
-def get_orders_by_hour(_engine):
-    """Get orders by hour of day (cached for 30 minutes)"""
-    return pd.read_sql("""
-        SELECT 
-            t.order_hour,
-            COUNT(*) as orders,
-            AVG(fo.total_items) as avg_basket
-        FROM Fact_Orders fo
-        JOIN Dim_Time t ON fo.time_id = t.time_id
-        GROUP BY t.order_hour
-        ORDER BY t.order_hour
-    """, _engine)
+    day = load_repository_data(
+        repository,
+        "day_trends",
+        loading_label="Loading day-of-week distribution…",
+    )
+    hour = load_repository_data(
+        repository,
+        "hour_trends",
+        loading_label="Loading hourly distribution…",
+    )
+    departments = load_repository_data(
+        repository,
+        "departments",
+        loading_label="Loading department mix…",
+    )
 
-def show(engine):
-    st.header("📊 Overview Dashboard")
-    st.markdown("Real-time business metrics and key performance indicators")
-    
-    # KPI Metrics
-    st.subheader("📈 Key Performance Indicators")
-    col1, col2, col3, col4 = st.columns(4)
-    
-    with col1:
-        try:
-            total_orders = get_total_orders(engine)
-            st.metric("Total Orders", f"{total_orders:,}")
-        except Exception as e:
-            st.metric("Total Orders", "N/A")
-            st.caption(f"Error: {str(e)[:50]}")
-    
-    with col2:
-        try:
-            total_users = get_total_users(engine)
-            st.metric("Total Users", f"{total_users:,}")
-        except Exception as e:
-            st.metric("Total Users", "N/A")
-            st.caption(f"Error: {str(e)[:50]}")
-    
-    with col3:
-        try:
-            total_products = get_total_products(engine)
-            st.metric("Total Products", f"{total_products:,}")
-        except Exception as e:
-            st.metric("Total Products", "N/A")
-            st.caption(f"Error: {str(e)[:50]}")
-    
-    with col4:
-        try:
-            avg_basket = get_avg_basket(engine)
-            st.metric("Avg Basket Size", f"{avg_basket:.1f}" if avg_basket else "N/A")
-        except Exception as e:
-            st.metric("Avg Basket Size", "N/A")
-            st.caption(f"Error: {str(e)[:50]}")
-    
-    st.markdown("---")
-    
-    # Row 2: Charts
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.subheader("📅 Orders by Day of Week")
-        try:
-            df_dow = get_orders_by_dow(engine)
-            
-            if not df_dow.empty:
-                fig = px.bar(
-                    df_dow, 
-                    x='dow_name', 
-                    y='orders',
-                    color='orders',
-                    color_continuous_scale='Blues',
-                    labels={'dow_name': 'Day of Week', 'orders': 'Number of Orders'}
-                )
-                fig.update_layout(showlegend=False)
-                st.plotly_chart(fig, width='stretch')
-            else:
-                st.info("No data available. Please run ETL pipeline first.")
-        except Exception as e:
-            st.error(f"Error loading data: {str(e)}")
-    
-    with col2:
-        st.subheader("🏪 Market Share by Department")
-        try:
-            df_dept = get_market_share(engine)
-            
-            if not df_dept.empty:
-                fig = px.pie(
-                    df_dept, 
-                    values='items', 
-                    names='department_name',
-                    hole=0.4,
-                    color_discrete_sequence=px.colors.sequential.RdBu
-                )
-                fig.update_traces(textposition='inside', textinfo='percent+label')
-                st.plotly_chart(fig, width='stretch')
-            else:
-                st.info("No data available. Please run ETL pipeline first.")
-        except Exception as e:
-            st.error(f"Error loading data: {str(e)}")
-    
-    # Row 3: Hourly trend
-    # st.markdown("---")
-    # st.subheader("⏰ Orders by Hour of Day")
-    # try:
-    #     df_hour = get_orders_by_hour(engine)
-        
-    #     if not df_hour.empty:
-    #         fig = px.line(
-    #             df_hour, 
-    #             x='order_hour', 
-    #             y='orders',
-    #             markers=True,
-    #             labels={'order_hour': 'Hour of Day', 'orders': 'Number of Orders'}
-    #         )
-    #         fig.update_traces(line_color='#1f77b4', line_width=3)
-    #         fig.update_layout(
-    #             hovermode='x unified',
-    #             xaxis=dict(tickmode='linear', tick0=0, dtick=2)
-    #         )
-    #         st.plotly_chart(fig, width='stretch')
-            
-    #         # Peak hour highlight
-    #         peak_hour = df_hour.loc[df_hour['orders'].idxmax()]
-    #         st.success(f"🔥 **Peak Hour:** {int(peak_hour['order_hour'])}:00 with {int(peak_hour['orders']):,} orders")
-    #     else:
-    #         st.info("No data available. Please run ETL pipeline first.")
-    # except Exception as e:
-    #     st.error(f"Error loading data: {str(e)}")
+    st.subheader("When customers shop")
+    day_ok = require_columns(day, ("dow_name", "orders", "share_pct"), context="Daily trend")
+    hour_ok = require_columns(
+        hour,
+        ("order_hour", "orders", "share_pct"),
+        context="Hourly trend",
+    )
+    left, right = st.columns(2)
+    if day_ok:
+        with left:
+            day_chart = px.bar(
+                day,
+                x="dow_name",
+                y="orders",
+                title="Orders by day of week",
+                labels={"dow_name": "Day", "orders": "Orders"},
+                color_discrete_sequence=[COLORS["blue"]],
+            )
+            day_chart.update_traces(hovertemplate="%{x}<br>%{y:,.0f} orders<extra></extra>")
+            plotly_chart(style_figure(day_chart), key="overview-day-orders")
+    if hour_ok:
+        with right:
+            hour_chart = px.area(
+                hour,
+                x="order_hour",
+                y="orders",
+                title="Orders by hour of day",
+                labels={"order_hour": "Hour", "orders": "Orders"},
+                color_discrete_sequence=[COLORS["primary"]],
+            )
+            hour_chart.update_traces(
+                line={"width": 3},
+                hovertemplate="%{x}:00<br>%{y:,.0f} orders<extra></extra>",
+            )
+            hour_chart.update_xaxes(tickmode="linear", tick0=0, dtick=3)
+            plotly_chart(style_figure(hour_chart), key="overview-hour-orders")
+
+    if day_ok and hour_ok:
+        peak_day = day.loc[day["orders"].idxmax()]
+        peak_hour = hour.loc[hour["orders"].idxmax()]
+        insight_left, insight_right = st.columns(2)
+        with insight_left:
+            insight_card(
+                "Highest-volume day",
+                f"{peak_day['dow_name']} contributes {peak_day['share_pct']:.1f}% of orders.",
+            )
+        with insight_right:
+            insight_card(
+                "Peak ordering hour",
+                f"Demand reaches its high point around {int(peak_hour['order_hour']):02d}:00.",
+            )
+
+    st.subheader("What customers buy")
+    department_ok = require_columns(
+        departments,
+        ("department_name", "market_share_pct", "total_items", "reorder_rate_pct"),
+        context="Department mix",
+    )
+    if department_ok:
+        condensed = _condense_departments(departments)
+        department_chart = px.bar(
+            condensed,
+            x="market_share_pct",
+            y="department_name",
+            orientation="h",
+            color="reorder_rate_pct",
+            color_continuous_scale=SEQUENTIAL_SCALE,
+            title="Item share across every department",
+            labels={
+                "market_share_pct": "Item share (%)",
+                "department_name": "Department",
+                "reorder_rate_pct": "Reorder rate (%)",
+            },
+        )
+        department_chart.update_traces(
+            hovertemplate=(
+                "%{y}<br>%{x:.1f}% of items<br>Reorder rate: %{marker.color:.1f}%<extra></extra>"
+            )
+        )
+        plotly_chart(
+            style_figure(department_chart, height=470),
+            key="overview-department-share",
+        )
+        top_department = departments.loc[departments["market_share_pct"].idxmax()]
+        insight_card(
+            "Largest item category",
+            (
+                f"{str(top_department['department_name']).title()} represents "
+                f"{top_department['market_share_pct']:.1f}% of all line items."
+            ),
+        )
+
+    with st.expander("View accessible data tables and downloads"):
+        if day_ok:
+            st.markdown("#### Day-of-week aggregate")
+            st.dataframe(day, width="stretch", hide_index=True)
+            download_frame(
+                day,
+                label="Download day aggregate",
+                file_name="instacart-orders-by-day.csv",
+                key="overview-download-day",
+            )
+        if hour_ok:
+            st.markdown("#### Hour aggregate")
+            st.dataframe(hour, width="stretch", hide_index=True)
+            download_frame(
+                hour,
+                label="Download hour aggregate",
+                file_name="instacart-orders-by-hour.csv",
+                key="overview-download-hour",
+            )
