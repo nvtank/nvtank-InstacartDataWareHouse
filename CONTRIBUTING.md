@@ -182,9 +182,9 @@ MPLBACKEND=Agg pytest \
   -W error::FutureWarning
 ```
 
-GitHub Actions is configured for Python 3.11 and 3.13. Its targeted coverage gates are 90%
-for the selected ETL modules and 80% for the selected dashboard modules. Do not weaken a gate
-to make an unrelated change pass; add meaningful coverage or explain why the measured scope
+GitHub Actions is configured for Python 3.11 and 3.13. Its coverage gates are 90% for the
+selected ETL modules and 80% for the complete `dashboard` package. Do not weaken a gate to
+make an unrelated change pass; add meaningful coverage or explain why the measured scope
 should change.
 
 ## Documentation and evidence

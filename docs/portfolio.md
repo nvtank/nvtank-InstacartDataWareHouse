@@ -136,7 +136,7 @@ The following checks were run locally on **2026-08-09** against this branch:
 | --- | --- | --- |
 | Offline test suite | `make qa` | `104 passed in 3.53s`; Ruff passed; no mining `FutureWarning` |
 | ETL coverage gate | Targeted ETL pytest command from CI | 51 tests passed; 97.52% coverage |
-| Dashboard coverage gate | Targeted dashboard pytest command from CI | 28 tests passed; 82.73% coverage; all six pages navigated |
+| Dashboard coverage gate | Dashboard pytest command from CI | 28 tests passed; 81.48% complete-package coverage; all six pages navigated |
 | MariaDB fixture integration | `make smoke-fixture` | Idempotent schema and packaged ETL passed; exact counts reconciled across seven tables |
 | Demo container health | `make demo-detached` plus health endpoint | Streamlit returned `ok`; application process ran as UID `10001` |
 | Runtime configuration | `make validate` | Shell syntax and all Compose profiles passed validation |
@@ -157,7 +157,7 @@ The 104-test default suite is intentionally offline and deterministic. The separ
 workflow proves schema application, real MariaDB writes, derived metrics, and post-load
 quality checks without pretending that a tiny fixture is a scale benchmark. GitHub Actions
 is configured to run on Python 3.11 and 3.13, enforce 90% coverage over the targeted ETL
-modules, enforce 80% coverage over the targeted dashboard modules, and treat mining
+modules, enforce 80% coverage over the complete dashboard package, and treat mining
 `FutureWarning` messages as errors. This document does not claim a current remote Actions
 result.
 

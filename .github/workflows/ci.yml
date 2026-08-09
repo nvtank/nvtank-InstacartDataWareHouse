@@ -2,6 +2,7 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
 
 permissions:
@@ -61,11 +62,7 @@ jobs:
           pytest \
             tests/test_dashboard_data.py \
             tests/test_dashboard_app.py \
-            --cov=dashboard.data \
-            --cov=dashboard.demo_data \
-            --cov=dashboard.components \
-            --cov=dashboard.styles \
-            --cov=dashboard.pages \
+            --cov=dashboard \
             --cov-report=term-missing \
             --cov-report=xml:coverage-dashboard.xml \
             --cov-fail-under=80

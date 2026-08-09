@@ -58,7 +58,7 @@ The following gates were run locally on 2026-08-09 against this branch:
 | --- | --- |
 | Complete offline suite | 104 tests passed with `FutureWarning` treated as error |
 | ETL contract suite | 51 tests; 97.52% targeted coverage |
-| Dashboard suite | 28 tests; 82.73% targeted coverage; all six pages navigated |
+| Dashboard suite | 28 tests; 81.48% complete-package coverage; all six pages navigated |
 | Mining and recommendation suite | 25 deterministic tests |
 | MariaDB fixture integration | Schema + ETL + validation passed; seven tables reconciled |
 | Container runtime | Streamlit health endpoint returned `ok`; process UID was `10001` |
